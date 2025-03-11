@@ -54,12 +54,11 @@ class Model:
         self.nodes = []
 
         # EP-specific variables
-        enable_cuda_graph = extra_options.get("enable_cuda_graph", "0")
         self.ep = ep
         self.ep_attrs = {
             "cpu": {},
             "cuda": {
-                "enable_cuda_graph": enable_cuda_graph,        # "1" if the the model is able to enable cuda graph, "0" otherwise
+                "enable_cuda_graph": extra_options.get("enable_cuda_graph", "0"),        # "1" if the model is able to enable cuda graph, "0" otherwise
             },
             "rocm": {
                 "tunable_op_enable": "1",
@@ -295,6 +294,7 @@ class Model:
             "int4": {
                 "accuracy_level": int(extra_options.get("int4_accuracy_level", 0)),   # Default is 0 for non-QDQ formats, default is 4 for QDQ formats
                 "block_size": int(extra_options.get("int4_block_size", 32)),
+                "is_symmetric": extra_options.get("int4_is_symmetric", True),
                 "op_types_to_quantize": extra_options.get("int4_op_types_to_quantize", ("MatMul", )),
             },
             "use_qdq": False,           # Use QDQ format
@@ -364,6 +364,11 @@ class Model:
             ep_options = { self.ep : self.ep_attrs[self.ep] }
             genai_config["model"]["decoder"]["session_options"]["provider_options"].append(ep_options)
 
+        if self.extra_options.get("prompt_templates", "0") == "1":
+            prompt_templates = self._get_prompt_templates(model_name_or_path, extra_kwargs)
+            if prompt_templates is not None:
+                genai_config["model"]["prompt_templates"] = prompt_templates
+
         print(f"Saving GenAI config in {out_dir}")
         with open(os.path.join(out_dir,"genai_config.json"), "w") as f:
             json.dump(genai_config, f, indent=4)
@@ -373,6 +378,30 @@ class Model:
         print(f"Saving processing files in {out_dir} for GenAI")
         tokenizer.save_pretrained(out_dir)
 
+    def _get_prompt_templates(self, hf_name, extra_kwargs):
+        try:
+            # disable end of sentence padding with eos_token=None
+            tokenizer = AutoTokenizer.from_pretrained(hf_name, token=self.hf_token, trust_remote_code=True, eos_token=None, **extra_kwargs)
+            system_template = tokenizer.apply_chat_template([{'role': 'system', 'content': '{Content}'}], tokenize=False)
+            system_user_template = tokenizer.apply_chat_template([{'role': 'system', 'content': '{Content}'}, {'role': 'user', 'content': '{Content}'}], tokenize=False)
+            system_user_assistant_template = tokenizer.apply_chat_template([{'role': 'system', 'content': '{Content}'}, {'role': 'user', 'content': '{Content}'}, {'role': 'assistant', 'content': '{Content}'}], tokenize=False)
+            assert system_user_template.startswith(system_template), "Chat templates may contain padding tokens, leading to incorrect prompt templates"
+            assert system_user_assistant_template.startswith(system_user_template), "Chat templates may contain padding tokens, leading to incorrect prompt templates"
+            user_template = system_user_template[len(system_template):]
+            assistant_template = system_user_assistant_template[len(system_user_template):]
+            prompt_template = system_user_assistant_template[len(system_template):]
+            prompt_template = prompt_template[:prompt_template.rfind('{Content}')]
+            templates = {
+                "system": system_template,
+                "user": user_template,
+                "assistant": assistant_template,
+                "prompt": prompt_template
+            }
+            return templates 
+        except Exception as e:
+            print(f"Failed to get prompt templates. Error: {e}")
+            return None
+        
     def save_model(self, out_dir):
         print(f"Saving ONNX model in {out_dir}")
         gc.collect()
@@ -435,7 +464,7 @@ class Model:
         quant = MatMul4BitsQuantizer(
             model=model,
             block_size=self.quant_attrs["int4"]["block_size"],
-            is_symmetric=True,
+            is_symmetric=self.quant_attrs["int4"]["is_symmetric"],
             accuracy_level=self.quant_attrs["int4"]["accuracy_level"],
             nodes_to_exclude=[],
             quant_format=QuantFormat.QDQ if self.quant_attrs["use_qdq"] else QuantFormat.QOperator,
@@ -1533,7 +1562,6 @@ class Model:
         self.layernorm_attrs["skip_input"] = f"{o_matmul_name if not o_bias_exists else o_add_name}/output_0"
 
     def make_attention_unpacked(self, layer_id, attention, root_input, **kwargs):
-
         qkv_proj = 'qkv_proj' if hasattr(attention, 'qkv_proj') else 'query_key_value'
         qkv_linear = eval(f"attention.{qkv_proj}")
 
@@ -1670,6 +1698,7 @@ class Model:
 
         mlp.up_proj = torch.nn.Linear(in_features=self.hidden_size, out_features=self.intermediate_size)
         mlp.up_proj.weight = torch.nn.Parameter(packed_proj.weight[self.intermediate_size :, :])
+
         # Delete original packed weights
         del packed_proj
 
@@ -1962,7 +1991,7 @@ class Model:
 
     def make_layer(self, layer_id, layer):
         # Each LLM decoder layer is typically defined as:
-        # input_layernorm --> attention --> MLP --> output_layernorm
+        # input_layernorm --> attention --> output_layernorm --> MLP
         self.make_layernorm(layer_id, layer.input_layernorm, skip=not self.layernorm_attrs["first_layernorm"], simple=self.layernorm_attrs["simple"], location="input")
         self.make_attention(layer_id, layer.self_attn, root_input=self.layernorm_attrs["output_0"])
         self.make_layernorm(layer_id, layer.post_attention_layernorm, skip=True, simple=self.layernorm_attrs["simple"], location="post_attention")
@@ -3012,6 +3041,15 @@ class ChatGLMModel(Model):
         super().make_layer(layer_id, layer)
 
 def check_extra_options(kv_pairs):
+    """
+    Check key-value pairs and set values correctly
+    """
+    if "int4_is_symmetric" in kv_pairs:
+        if kv_pairs["int4_is_symmetric"] in {"false", "False", "0"}:
+            kv_pairs["int4_is_symmetric"] = False
+        elif kv_pairs["int4_is_symmetric"] in {"true", "True", "1"}:
+            kv_pairs["int4_is_symmetric"] = True
+    
     if "int4_op_types_to_quantize" in kv_pairs:
         op_types_to_quantize = ()
         for op_type in kv_pairs["int4_op_types_to_quantize"].split("/"):
@@ -3027,7 +3065,7 @@ def check_extra_options(kv_pairs):
 
 def parse_extra_options(kv_items):
     """
-    Parse key value pairs that are separated by '='
+    Parse key-value pairs that are separated by '='
     """
     kv_pairs = {}
 
@@ -3201,6 +3239,8 @@ def get_args():
                     2 is fp16.
                     1 is fp32.
                 int4_block_size = 16/32/64/128/256: Specify the block_size for int4 quantization.
+                int4_is_symmetric = Quantize the weights symmetrically. Default is true.
+                    If true, quantization is done to int4. If false, quantization is done to uint4.
                 int4_op_types_to_quantize = MatMul/Gather: Specify op types to target for int4 quantization.
                     Use this option when you want to quantize specific ops.
                     Separate the op types with a '/' when passing them here (e.g. int4_op_types_to_quantize=MatMul/Gather)
@@ -3224,6 +3264,7 @@ def get_args():
                     If you have already authenticated via `huggingface-cli login`, you do not need to use this flag because Hugging Face has already stored your authentication token for you.
                 use_qdq = 1: Use the QDQ decomposition for quantized MatMul instead of the MatMulNBits operator.
                 adapter_path = Path to folder on disk containing the adapter files (adapter_config.json and adapter model weights).
+                prompt_templates = 1: Include per-role prompt templates in the GenAI config file. Default is 0 (not to include).
             """),
     )
 
