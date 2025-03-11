@@ -29,7 +29,8 @@ namespace Generators {
 State::State(const GeneratorParams& params, const Model& model)
     : model_{model},
       params_{params.shared_from_this()},
-      run_options_{OrtRunOptions::Create()} {}
+      run_options_{OrtRunOptions::Create()},
+      extra_outputs_{*this} {}
 
 void State::Run(OrtSession& session, int new_batch_size) {
   auto captured_graph_info = GetCapturedGraphInfo();
@@ -38,11 +39,15 @@ void State::Run(OrtSession& session, int new_batch_size) {
     if (captured_graph_info) {
       run_options_->AddConfigEntry("gpu_graph_id", "-1");
     }
+    extra_outputs_.Add(session.GetOutputNames());
     first_run_ = false;
-  } else if (captured_graph_info && new_batch_size != current_batch_size_) {
-    current_batch_size_ = new_batch_size;
-    auto annotation_id = std::to_string(captured_graph_info->GenerateUniqueAnnotationID(new_batch_size));
-    run_options_->AddConfigEntry("gpu_graph_id", annotation_id.c_str());
+  } else {
+    if (captured_graph_info && new_batch_size != current_batch_size_) {
+      current_batch_size_ = new_batch_size;
+      auto annotation_id = std::to_string(captured_graph_info->GenerateUniqueAnnotationID(new_batch_size));
+      run_options_->AddConfigEntry("gpu_graph_id", annotation_id.c_str());
+    }
+    extra_outputs_.Update();
   }
 
   if (g_log.enabled && g_log.model_input_values) {
@@ -59,6 +64,8 @@ void State::Run(OrtSession& session, int new_batch_size) {
 
   session.Run(run_options_.get(), input_names_.data(), inputs_.data(), input_names_.size(),
               output_names_.data(), outputs_.data(), output_names_.size());
+
+  extra_outputs_.RegisterOutputs();
 
   if (g_log.enabled && g_log.model_output_values) {
     auto& stream = Log("model_output_values");
@@ -317,14 +324,12 @@ void Model::InitDeviceAllocator(OrtSession& session) {
   }
 #endif
 
-#if USE_WEBGPU
   if (device_type_ == DeviceType::WEBGPU) {
     // for webgpu we only use device memory for kv_cache
     memory_info_device_ = OrtMemoryInfo::Create("WebGPU_Buffer", OrtAllocatorType::OrtDeviceAllocator, 0, OrtMemType::OrtMemTypeDefault);
     owned_allocator_device_ = Ort::Allocator::Create(session, *memory_info_device_);
     allocator_kvcache_ = owned_allocator_device_.get();
   }
-#endif
 
   if (device_type_ == DeviceType::QNN) {
     memory_info_device_ = OrtMemoryInfo::Create("QnnHtpShared", OrtAllocatorType::OrtDeviceAllocator, 0,
