@@ -285,12 +285,15 @@ class Model:
             self.lm_head_attrs["mask"] = dummy_tokens_mask
 
         # Quantization-specific variables (INT4, INT8, etc.)
+        int4_algo_config = self.make_int4_algo_config(extra_options.get("int4_algo_config", "default"))
         self.quant_attrs = {
             "int4": {
                 "accuracy_level": int(extra_options.get("int4_accuracy_level", 4 if self.ep == "cpu" else 0)),   # Default is 0 for non-QDQ formats, default is 4 for QDQ formats
                 "block_size": int(extra_options.get("int4_block_size", 32)),
                 "is_symmetric": extra_options.get("int4_is_symmetric", True),
                 "op_types_to_quantize": extra_options.get("int4_op_types_to_quantize", ("MatMul", )),
+                "nodes_to_exclude": extra_options.get("int4_nodes_to_exclude", []),
+                "algo_config": int4_algo_config,
             },
             "use_qdq": extra_options.get("use_qdq", False),           # Use QDQ format
         }
@@ -374,7 +377,7 @@ class Model:
                 },
                 "eos_token_id": config.eos_token_id,
                 "pad_token_id": config.pad_token_id if hasattr(config, "pad_token_id") and config.pad_token_id is not None else config.eos_token_id[0] if isinstance(config.eos_token_id, list) else config.eos_token_id,
-                "type": self.model_type[ : self.model_type.find("For")].lower(),
+                "type": self.model_type[ : self.model_type.find("For") if "For" in self.model_type else len(self.model_type)].lower(),
                 "vocab_size": self.vocab_size,
             },
             "search": {
@@ -495,15 +498,44 @@ class Model:
             convert_attribute=False,
         )
 
+    def make_int4_algo_config(self, quant_method):
+        int4_algo_config = None
+        if quant_method == "rtn":
+            from onnxruntime.quantization.matmul_nbits_quantizer import RTNWeightOnlyQuantConfig
+            int4_algo_config = RTNWeightOnlyQuantConfig()
+        elif quant_method in ["k_quant_mixed", "k_quant_last"]:
+            from onnxruntime.quantization.matmul_nbits_quantizer import KQuantWeightOnlyQuantConfig
+            if quant_method == "k_quant_mixed":
+                # k_quant_mixed is from llama.cpp.
+                # Reference: https://github.com/ggml-org/llama.cpp/blob/36667c8edcded08063ed51c7d57e9e086bbfc903/src/llama-quant.cpp#L136
+                # We also consider some MatMuls are more senstive to quantization than other MatMuls.
+                layers_to_exclude = [
+                    i
+                    for i in range(self.num_layers)
+                    if i < self.num_layers / 8 or i >= 7 * self.num_layers / 8 or (i - (round)(self.num_layers / 8)) % 3 == 2
+                ]
+                customized_weight_config = {}
+                for i in layers_to_exclude:
+                    customized_weight_config["/model/layers." + str(i) + "/attn/qkv_proj/MatMul"] = {"bits": 8}
+                    customized_weight_config["/model/layers." + str(i) + "/mlp/down_proj/MatMul"] = {"bits": 8}
+                    # Gemma model
+                    customized_weight_config["/model/layers." + str(i) + "/attn/v_proj/MatMul"] = {"bits": 8}
+                customized_weight_config["/lm_head/MatMul"] = {"bits": 8}
+            elif quant_method == "k_quant_last":
+                customized_weight_config = {"/lm_head/MatMul": {"bits": 8}}
+            int4_algo_config = KQuantWeightOnlyQuantConfig(customized_weight_config=customized_weight_config)
+        return int4_algo_config
+
     def to_int4(self, model):
         quant = MatMulNBitsQuantizer(
             model=model,
             block_size=self.quant_attrs["int4"]["block_size"],
             is_symmetric=self.quant_attrs["int4"]["is_symmetric"],
             accuracy_level=self.quant_attrs["int4"]["accuracy_level"],
-            nodes_to_exclude=[],
+            nodes_to_exclude=self.quant_attrs["int4"]["nodes_to_exclude"],
             quant_format=QuantFormat.QDQ if self.quant_attrs["use_qdq"] else QuantFormat.QOperator,
             op_types_to_quantize=self.quant_attrs["int4"]["op_types_to_quantize"],
+            algo_config=self.quant_attrs["int4"]["algo_config"],
         )
         quant.process()
         return quant.model.model
@@ -2150,14 +2182,14 @@ class Model:
 
         if softcap_exists:
             # Add final logit softcapping (Div --> Tanh --> Mul)
-            div_name = "/lm_head/Div"
+            div_name = "/lm_head/softcap/Div"
             div_inputs = [f"{lm_name}/output_0", f"/model/constants/{self.to_str_dtype[self.io_dtype]}/0D/{self.lm_head_attrs['softcap']}"]
             self.make_div(div_name, div_inputs, dtype=self.io_dtype, shape=['batch_size', 'sequence_length', self.vocab_size])
 
-            tanh_name = "/lm_head/Tanh"
+            tanh_name = "/lm_head/softcap/Tanh"
             self.make_tanh(tanh_name, f"{div_name}/output_0", dtype=self.io_dtype, shape=['batch_size', 'sequence_length', self.vocab_size])
 
-            mul_name = "/lm_head/Mul"
+            mul_name = "/lm_head/softcap/Mul"
             mul_inputs = [f"{tanh_name}/output_0", f"/model/constants/{self.to_str_dtype[self.io_dtype]}/0D/{self.lm_head_attrs['softcap']}"]
             mul_output = "logits"
             self.make_node('Mul', inputs=mul_inputs, outputs=[mul_output], name=mul_name)
@@ -2258,9 +2290,10 @@ class Model:
        hf_norm = hasattr(model, "model") and hasattr(model.model, "norm") and module == model.model.norm
        hf_final_layernorm = hasattr(model, "model") and hasattr(model.model, "final_layernorm") and module == model.model.final_layernorm
        hf_transformer_final_layernorm = hasattr(model, "transformer") and hasattr(model.transformer, "encoder") and hasattr(model.transformer.encoder, "final_layernorm") and module == model.transformer.encoder.final_layernorm
+       hf_multimodal_final_layernorm = hasattr(model, "language_model") and hasattr(model.language_model, "model") and hasattr(model.language_model.model, "norm") and module == model.language_model.model.norm
        # GGUF names
        gguf_final_norm = hasattr(model, "final_norm") and module == model.final_norm
-       return hf_norm or hf_final_layernorm or hf_transformer_final_layernorm or gguf_final_norm
+       return hf_norm or hf_final_layernorm or hf_transformer_final_layernorm or hf_multimodal_final_layernorm or gguf_final_norm
 
     def make_preprocessing_nodes(self):
         self.make_attention_mask_reformatting()
@@ -2724,6 +2757,16 @@ class QwenModel(MistralModel):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
 
 
+class Qwen3Model(QwenModel):
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+
+    def make_attention_init(self):
+        self.attention_attrs["q_norm"] = True
+        self.attention_attrs["k_norm"] = True
+        super().make_attention_init()
+
+
 class PhiModel(Model):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
@@ -2761,7 +2804,6 @@ class Gemma2Model(GemmaModel):
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
         self.attention_attrs["scale"] = config.query_pre_attn_scalar ** -0.5
-        self.lm_head_attrs["scale"] = config.final_logit_softcapping if config.final_logit_softcapping is not None else 1.0
         self.is_local = lambda layer_id: layer_id % 2 == 1
 
     def make_layer(self, layer_id, layer):
@@ -3288,6 +3330,12 @@ def check_extra_options(kv_pairs):
         for op_type in kv_pairs["int4_op_types_to_quantize"].split("/"):
             op_types_to_quantize += (op_type, )
         kv_pairs["int4_op_types_to_quantize"] = op_types_to_quantize
+    
+    if "int4_nodes_to_exclude" in kv_pairs:
+        nodes_to_exclude = []
+        for node in kv_pairs["int4_nodes_to_exclude"].split(","):
+            nodes_to_exclude.append(node)
+        kv_pairs["int4_nodes_to_exclude"] = nodes_to_exclude
 
     if "exclude_lm_head" in kv_pairs and "include_hidden_states" in kv_pairs:
         # 'exclude_lm_head' is for when 'hidden_states' are outputted and 'logits' are not outputted
@@ -3405,6 +3453,8 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
             onnx_model = Phi4MMModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         elif config.architectures[0] == "Qwen2ForCausalLM":
             onnx_model = QwenModel(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
+        elif config.architectures[0] == "Qwen3ForCausalLM":
+            onnx_model = Qwen3Model(config, io_dtype, precision, execution_provider, cache_dir, extra_options)
         else:
             raise NotImplementedError(f"The {hf_name} model is not currently supported.")
 
@@ -3497,6 +3547,13 @@ def get_args():
                 int4_op_types_to_quantize = MatMul/Gather: Specify op types to target for int4 quantization.
                     Use this option when you want to quantize specific ops.
                     Separate the op types with a '/' when passing them here (e.g. int4_op_types_to_quantize=MatMul/Gather)
+                int4_nodes_to_exclude = Specify nodes to exclude from int4 quantization. 
+                    Use this option when you want to exclude certain nodes from being quantized.
+                    Separate the node names with a ',' when passing them here (e.g. int4_nodes_to_exclude=/lm_head/MatMul,/model/embed_tokens/Gather)
+                int4_algo_config = Method for int4 quantization. Default is 'default'.
+                    Currently supported options are: 'default', 'rtn', 'k_quant_mixed', 'k_quant_last'.
+                    k_quant_mixed = k_quant algorithm with mixed precision (int4 + int8).
+                    k_quant_last = k_quant algorithm where only the last MatMul (/lm_head/MatMul) is quantized as int8. Other MatMuls are quantized as int4.
                 num_hidden_layers = Manually specify the number of layers in your ONNX model (for unit testing purposes).
                 filename = Filename for ONNX model (default is 'model.onnx').
                     For models with multiple components, each component is exported to its own ONNX model.
