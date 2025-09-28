@@ -80,18 +80,18 @@ jobs:
         run: |
           python -m pip install wheel requests
 
-          cmake --preset windows_arm64_cpu_release -DUSE_GUIDANCE=ON
+          cmake --preset windows_arm64_cpu_release
 
       - name: Build with CMake
         run: |
-          cmake --build --preset windows_arm64_cpu_release --parallel -DUSE_GUIDANCE=ON
+          cmake --build --preset windows_arm64_cpu_release --parallel
 
       - name: Install the Python Wheel and Test Dependencies
         run: |
           # Uninstalling LLVM/Clang as it is no longer required and causes issues with numpy installation
           choco uninstall llvm --yes
           python -m pip install "numpy<2" coloredlogs flatbuffers packaging protobuf sympy pytest
-          python -m pip install -i https://aiinfra.pkgs.visualstudio.com/PublicPackages/_packaging/ORT-Nightly/pypi/simple/ ort-nightly-qnn
+          python -m pip install onnxruntime-qnn
           python -m pip install (Get-ChildItem ("$env:binaryDir\wheel\*.whl")) --no-deps
 
       - name: Run the Python Tests
