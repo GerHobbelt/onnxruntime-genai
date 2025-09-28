@@ -84,6 +84,28 @@ State::State(const GeneratorParams& params, const Model& model)
   }
 }
 
+void State::DumpInputs() {
+  if (g_log.enabled && g_log.model_input_values) {
+    auto& stream = Log("model_input_values");
+    stream << std::endl;
+    DumpTensors(model_, stream, inputs_.data(), input_names_.data(), input_names_.size(), true);
+  }
+
+  if (g_log.enabled && g_log.model_output_shapes) {
+    auto& stream = Log("model_output_shapes");
+    stream << std::endl;
+    DumpTensors(model_, stream, outputs_.data(), output_names_.data(), output_names_.size(), false);
+  }
+}
+
+void State::DumpOutputs() {
+  if (g_log.enabled && g_log.model_output_values) {
+    auto& stream = Log("model_output_values");
+    stream << std::endl;
+    DumpTensors(model_, stream, outputs_.data(), output_names_.data(), output_names_.size(), true);
+  }
+}
+
 void State::Run(OrtSession& session, bool graph_capture_this_run) {
   DurationTrace trace{"State::Run"};
 
@@ -108,17 +130,7 @@ void State::Run(OrtSession& session, bool graph_capture_this_run) {
     }
   }
 
-  if (g_log.enabled && g_log.model_input_values) {
-    auto& stream = Log("model_input_values");
-    stream << std::endl;
-    DumpTensors(model_, stream, inputs_.data(), input_names_.data(), input_names_.size(), true);
-  }
-
-  if (g_log.enabled && g_log.model_output_shapes) {
-    auto& stream = Log("model_output_shapes");
-    stream << std::endl;
-    DumpTensors(model_, stream, outputs_.data(), output_names_.data(), output_names_.size(), false);
-  }
+  DumpInputs();
 
   if (!ep_dynamic_options_next_run_.empty()) {
     std::vector<const char*> keys;
@@ -136,11 +148,7 @@ void State::Run(OrtSession& session, bool graph_capture_this_run) {
 
   extra_outputs_.RegisterOutputs();
 
-  if (g_log.enabled && g_log.model_output_values) {
-    auto& stream = Log("model_output_values");
-    stream << std::endl;
-    DumpTensors(model_, stream, outputs_.data(), output_names_.data(), output_names_.size(), true);
-  }
+  DumpOutputs();
 }
 
 void State::SetTerminate() {
@@ -266,7 +274,7 @@ std::vector<int32_t> Tokenizer::Encode(const char* text) const {
 
 std::string Tokenizer::Decode(std::span<const int32_t> tokens) const {
   OrtxPtr<OrtxStringArray> ortx_string_array;
-  CheckResult(OrtxDetokenize1D(tokenizer_, reinterpret_cast<const uint32_t*>(tokens.data()), tokens.size(), ortx_string_array.Address()));
+  CheckResult(OrtxDetokenize1DWithOptions(tokenizer_, reinterpret_cast<const uint32_t*>(tokens.data()), tokens.size(), ortx_string_array.Address(), true /* skip_special_tokens */));
 
   const char* string;
   CheckResult(OrtxStringArrayGetItem(ortx_string_array, 0, &string));
@@ -344,7 +352,7 @@ void ConfigureNvTensorRtRTxProfile(const Config& config, OrtSessionOptions& sess
   const int num_layers = config.model.decoder.num_hidden_layers;
   const int num_kv_heads = config.model.decoder.num_key_value_heads;
   const int head_dim = config.model.decoder.head_size;
-  const int batch_size = config.search.batch_size;
+  const int batch_size = config.search.batch_size * config.search.num_beams;
 
   // Get max context length from config
   const int max_context_len = config.model.context_length;
@@ -433,20 +441,25 @@ void ConfigureNvTensorRtRTxProfile(const Config& config, OrtSessionOptions& sess
     session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_opt_shapes", opt_shapes.str().c_str());
     session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_profile_max_shapes", max_shapes.str().c_str());
   } else {
-    // Single profile mode: simple shapes with batch_dim=[0,1,1] and seq_dim=[0,1,max_context_len]
+    // Single profile mode: simple shapes with batch_dim=[1,1,batch_size] and seq_dim=[1,1024,max_context_len]
     std::ostringstream min_shapes, opt_shapes, max_shapes;
 
-    // MIN SHAPES: batch_dim=0, seq_dim=0
-    min_shapes << Config::Defaults::InputIdsName << ":0x0,"
-               << Config::Defaults::AttentionMaskName << ":0x0";
-    add_key_value_cache_shapes(min_shapes, 0, past_key_pattern, past_value_pattern, 0, num_layers, num_kv_heads, head_dim);
+    // MIN SHAPES: batch_dim=1, seq_dim=1
+    constexpr int min_context_len = 1;
+    constexpr int min_batch_size = 1;
+    min_shapes << Config::Defaults::InputIdsName << ":" << min_batch_size << "x" << min_context_len << ","
+               << Config::Defaults::AttentionMaskName << ":" << min_batch_size << "x" << min_context_len;
+    add_key_value_cache_shapes(min_shapes, min_batch_size, past_key_pattern, past_value_pattern, 0, num_layers, num_kv_heads, head_dim);
 
-    // OPT SHAPES: batch_dim=1, seq_dim=1
-    opt_shapes << Config::Defaults::InputIdsName << ":1x1,"
-               << Config::Defaults::AttentionMaskName << ":1x1";
-    add_key_value_cache_shapes(opt_shapes, 1, past_key_pattern, past_value_pattern, 1, num_layers, num_kv_heads, head_dim);
+    // OPT SHAPES: batch_dim=1, seq_dim=1024
+    const int opt_context_len = std::min(max_context_len / 2, 1024);  // Use a reasonable opt context length
+    constexpr int opt_batch_size = 1;                                 // Use a opt batch size of 1
+    // keeping seq length to 1 as optimizing for the gen phase
+    opt_shapes << Config::Defaults::InputIdsName << ":" << opt_batch_size << "x" << 1 << ","
+               << Config::Defaults::AttentionMaskName << ":" << opt_batch_size << "x" << opt_context_len;
+    add_key_value_cache_shapes(opt_shapes, opt_batch_size, past_key_pattern, past_value_pattern, opt_context_len, num_layers, num_kv_heads, head_dim);
 
-    // MAX SHAPES: batch_dim=1, seq_dim=max_context_len
+    // MAX SHAPES: seq_dim=max_context_len
     max_shapes << Config::Defaults::InputIdsName << ":" << batch_size << "x" << max_context_len << ","
                << Config::Defaults::AttentionMaskName << ":" << batch_size << "x" << max_context_len;
     add_key_value_cache_shapes(max_shapes, batch_size, past_key_pattern, past_value_pattern, max_context_len, num_layers, num_kv_heads, head_dim);
@@ -571,7 +584,7 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
         bool is_multi_profile_enabled = IsMultiProfileEnabled(config.model.decoder.session_options);
         ConfigureNvTensorRtRTxProfile(config, session_options, is_multi_profile_enabled);
         if (IsGraphCaptureEnabled(config.model.decoder.session_options)) {
-          session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.nv_cuda_graph_enable", "1");
+          session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.enable_cuda_graph", "1");
         }
         p_device = GetDeviceInterface(DeviceType::NvTensorRtRtx);
       }
@@ -834,9 +847,70 @@ void Model::CreateSessionOptionsFromConfig(const Config::SessionOptions& config_
     session_options.AddConfigEntry(config_entry.first.c_str(), config_entry.second.c_str());
   }
 
+  // Register custom ops libraries only if explicitly configured
   if (config_session_options.custom_ops_library.has_value()) {
-    fs::path custom_library_file_prefix{config_session_options.custom_ops_library.value()};
-    session_options.RegisterCustomOpsLibrary(custom_library_file_prefix.c_str());
+    // From include/onnxruntime/core/session/onnxruntime_ep_device_ep_metadata_keys.h
+    constexpr const char* const library_path_metadata_key_name = "library_path";
+
+    std::string custom_library_file_prefix = config_session_options.custom_ops_library.value();
+
+    // If relative path, try to resolve using multiple search locations
+    fs::path custom_library_path{custom_library_file_prefix};
+    if (custom_library_path.is_relative()) {
+      bool resolved = false;
+
+      // First try: resolve relative to GenAI model folder (most intuitive for users)
+      fs::path model_relative_path = config_->config_path / custom_library_path;
+      if (fs::exists(model_relative_path)) {
+        custom_library_file_prefix = model_relative_path.string();
+        resolved = true;
+      }
+
+      // Second try: resolve relative to EP library directory (for system-wide installations)
+      if (!resolved) {
+        size_t num_devices = 0;
+        const OrtEpDevice* const* device_ptrs = nullptr;
+        Ort::GetEpDevices(&GetOrtEnv(), &device_ptrs, &num_devices);
+
+        for (size_t i = 0; i < num_devices && !resolved; ++i) {
+          const OrtKeyValuePairs* keyvals = Ort::GetEpDeviceMetadata(device_ptrs[i]);
+          size_t num_entries = 0;
+          const char* const* keys = nullptr;
+          const char* const* values = nullptr;
+          Ort::GetKeyValuePairs(keyvals, &keys, &values, &num_entries);
+
+          for (size_t kvi = 0; kvi < num_entries; kvi++) {
+            const std::string key = keys[kvi];
+            const std::string val = values[kvi];
+            if (key == library_path_metadata_key_name) {
+              fs::path ep_library_dir = fs::path(val).parent_path();
+              fs::path resolved_path = ep_library_dir / custom_library_path;
+              if (fs::exists(resolved_path)) {
+                custom_library_file_prefix = resolved_path.string();
+                resolved = true;
+                break;
+              }
+            }
+          }
+        }
+      }
+
+      // Third try: resolve relative to current working directory (for development/portable apps)
+      if (!resolved) {
+        char cwd_buffer[PATH_MAX];
+        if (GETCWD(cwd_buffer, sizeof(cwd_buffer))) {
+          fs::path cwd_relative_path = fs::path(cwd_buffer) / custom_library_path;
+          if (fs::exists(cwd_relative_path)) {
+            custom_library_file_prefix = cwd_relative_path.string();
+            resolved = true;
+          }
+        }
+      }
+    }
+
+    // Convert to fs::path for proper wide string handling on Windows
+    fs::path custom_ops_lib_path(custom_library_file_prefix);
+    session_options.RegisterCustomOpsLibrary(custom_ops_lib_path.c_str());
   }
 
   if (config_session_options.graph_optimization_level.has_value()) {
