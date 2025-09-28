@@ -16,27 +16,22 @@ import os
 import textwrap
 from typing import Any, Literal, Sequence
 
-from tqdm import tqdm
 import numpy as np
 import onnx_ir as ir
-from onnx_ir import tensor_adapters
 import torch
+from onnx_ir import tensor_adapters
 from onnxruntime.quantization.matmul_nbits_quantizer import (
     MatMulNBitsQuantizer,
     QuantFormat,
     RTNWeightOnlyQuantConfig,
 )
+from tqdm import tqdm
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoTokenizer,
     GenerationConfig,
 )
-
-
-# NOTE: Avoid importing from onnx helper and numpy_helper. Instead, leverage
-# ONNX IR methods like ir.tensor, ir.DataType.numpy() and other methods for constructing
-# the ONNX graph efficiently.
 
 
 class Model:
@@ -142,32 +137,6 @@ class Model:
 
         # Store names of nodes already created
         self.node_names: set[str] = set()
-
-        # Map ONNX dtypes to PyTorch dtypes
-        self.to_torch_dtype = {
-            ir.DataType.BFLOAT16: torch.bfloat16,
-            ir.DataType.BOOL: torch.bool,
-            ir.DataType.COMPLEX128: torch.complex128,
-            ir.DataType.COMPLEX64: torch.complex64,
-            ir.DataType.DOUBLE: torch.float64,
-            ir.DataType.FLOAT: torch.float32,
-            ir.DataType.FLOAT16: torch.float16,
-            ir.DataType.FLOAT8E4M3FN: torch.float8_e4m3fn,
-            ir.DataType.FLOAT8E4M3FNUZ: torch.float8_e4m3fnuz,
-            ir.DataType.FLOAT8E5M2: torch.float8_e5m2,
-            ir.DataType.FLOAT8E5M2FNUZ: torch.float8_e5m2fnuz,
-            ir.DataType.INT16: torch.int16,
-            ir.DataType.INT32: torch.int32,
-            ir.DataType.INT64: torch.int64,
-            ir.DataType.INT8: torch.int8,
-            ir.DataType.UINT16: torch.uint16,
-            ir.DataType.UINT32: torch.uint32,
-            ir.DataType.UINT64: torch.uint64,
-            ir.DataType.UINT8: torch.uint8,
-        }
-
-        # Map PyTorch dtypes to ONNX dtypes
-        self.to_onnx_dtype = {v: k for k, v in self.to_torch_dtype.items()}
 
         # Mask-specific variables
         # TODO: Reconcile differences between `seqlens_k` and `key_total_seq_lens` in the GroupQueryAttention and SparseAttention implementations. Ideally the same subgraph can be shared for both.
@@ -370,6 +339,7 @@ class Model:
         valid_gqa_configurations = {
             ("cpu", ir.DataType.FLOAT),
             ("cuda", ir.DataType.FLOAT16),
+            ("cuda", ir.DataType.BFLOAT16),
             ("rocm", ir.DataType.FLOAT16),
             ("dml", ir.DataType.FLOAT16),
             ("webgpu", ir.DataType.FLOAT16),
@@ -454,7 +424,7 @@ class Model:
                 "past_present_share_buffer": False if "config_only" in self.extra_options else self.past_present_share_buffer,
                 "repetition_penalty": config.repetition_penalty if hasattr(config, "repetition_penalty") else 1.0,
                 "temperature": config.temperature if hasattr(config, "temperature") else 1.0,
-                "top_k": 1,
+                "top_k": config.top_k if hasattr(config, "top_k") else 50,
                 "top_p": config.top_p if hasattr(config, "top_p") else 1.0,
             },
         }
@@ -569,7 +539,7 @@ class Model:
             # Cast the tensor lazily if `to` is provided
             def tensor_func():
                 nonlocal tensor
-                tensor = tensor.to(self.to_torch_dtype[to])
+                tensor = tensor.to(tensor_adapters.to_torch_dtype(to))
                 return tensor_adapters.TorchTensor(tensor, name=name)
 
             ir_tensor = ir.LazyTensor(
@@ -903,7 +873,7 @@ class Model:
             *qweight_shape[:-2],
             qweight_shape[-2] * qweight_shape[-1] * 2 // quantized_op.group_size,
         ]
-        scales_pt = quantized_op.scales.to(self.to_torch_dtype[self.io_dtype])
+        scales_pt = quantized_op.scales.to(tensor_adapters.to_torch_dtype(self.io_dtype))
         scales_pt = scales_pt.reshape(scales_target_shape)
         self.make_initializer(scales_pt, scales)
 
@@ -1323,9 +1293,9 @@ class Model:
             # Slice cos/sin caches from (M, H) to (M, H/2)
             hidden_dim = cos_cache.shape[-1]
             cos_cache = cos_cache.squeeze()[:, : (hidden_dim // 2)]
-            cos_cache = cos_cache.to(self.to_torch_dtype[self.io_dtype])
+            cos_cache = cos_cache.to(tensor_adapters.to_torch_dtype(self.io_dtype))
             sin_cache = sin_cache.squeeze()[:, : (hidden_dim // 2)]
-            sin_cache = sin_cache.to(self.to_torch_dtype[self.io_dtype])
+            sin_cache = sin_cache.to(tensor_adapters.to_torch_dtype(self.io_dtype))
 
             # Slice cos/sin caches from (M, H/2) to (M, R/2) if partial rotary embeddings are used
             if self.rotemb_attrs["partial_rotary_factor"] != 1.0:
@@ -1578,11 +1548,9 @@ class Model:
 
         # Save kwargs shared by LayerNorm ops and precision types to use
         layernorm_kwargs = {"epsilon": self.layernorm_attrs["epsilon"], "axis": -1, "stash_type": 1}
-        old_torch_dtype = self.to_torch_dtype[self.io_dtype]
         old_io_dtype = self.io_dtype
-        new_torch_dtype = torch.float32 if self.layernorm_attrs["cast"]["use_fp32"] else self.to_torch_dtype[self.io_dtype]
-        new_io_dtype = self.to_onnx_dtype[new_torch_dtype]
-        cast = old_torch_dtype != new_torch_dtype
+        new_io_dtype = ir.DataType.FLOAT if self.layernorm_attrs["cast"]["use_fp32"] else self.io_dtype
+        cast = old_io_dtype != new_io_dtype
 
         # Reshape Q MatMul from BxSxD to Bx(SxN)xH before LayerNorm
         q_reshape_1_name = f"/model/layers.{layer_id}/attn/q_norm/Reshape_1"
@@ -2501,7 +2469,7 @@ class Model:
             self.make_initializer(self.lm_head_attrs["mask"], logits_mask_name)
 
             where_name = "/lm_head/Where"
-            where_inputs = [logits_mask_name, f"/model/constants/{self.to_str_dtype(self.io_dtype)}/{torch.finfo(self.to_torch_dtype[self.io_dtype]).min}", f"{lm_name}/output_0"]
+            where_inputs = [logits_mask_name, f"/model/constants/{self.to_str_dtype(self.io_dtype)}/{torch.finfo(tensor_adapters.to_torch_dtype(self.io_dtype)).min}", f"{lm_name}/output_0"]
             where_output = "logits" if not any(exists_checks[3:]) else f"{where_name}/output_0"
             self.make_node('Where', inputs=where_inputs, outputs=[where_output], name=where_name)
             self.make_value(where_output, self.io_dtype, shape=['batch_size', 'sequence_length', self.vocab_size])
@@ -2800,7 +2768,7 @@ class Model:
         concat_inputs = [f"{unsqueeze_4_name}/output_0", f"{unsqueeze_5_name}/output_0"]
         self.make_concat(concat_2_name, concat_inputs, dtype=ir.DataType.INT64, shape=[2], axis=0)
         constant_shape_name = f"{basename}/ConstantOfShape_2"
-        constant_shape_torch_dtype = self.to_torch_dtype[self.io_dtype]
+        constant_shape_torch_dtype = tensor_adapters.to_torch_dtype(self.io_dtype)
         constant_shape_value = ir.tensor(torch.tensor([torch.finfo(constant_shape_torch_dtype).min], dtype=constant_shape_torch_dtype), name="make_input_ids_subgraph_shape")
         self.make_constant_of_shape(constant_shape_name, f"{concat_2_name}/output_0", value=constant_shape_value, dtype=self.io_dtype, shape=['unk', 'unk'])
 
@@ -2885,7 +2853,7 @@ class Model:
         cast_2_name = f"{basename}/Cast_2"
         self.make_cast(cast_2_name, f"{sub_name}/output_0", dtype=ir.DataType.BOOL, shape=["unk", "unk", "unk", "unk"])
         where_2_name = f"{basename}/Where_2"
-        where_2_inputs = [f"{cast_2_name}/output_0", f"/model/constants/{self.to_str_dtype(self.io_dtype)}/{torch.finfo(self.to_torch_dtype[self.io_dtype]).min}", f"{sub_name}/output_0"]
+        where_2_inputs = [f"{cast_2_name}/output_0", f"/model/constants/{self.to_str_dtype(self.io_dtype)}/{torch.finfo(tensor_adapters.to_torch_dtype(self.io_dtype)).min}", f"{sub_name}/output_0"]
         self.make_where(where_2_name, where_2_inputs, dtype=self.io_dtype, shape=["unk", "unk", "unk", "unk"])
 
         return where_2_name
@@ -3651,6 +3619,20 @@ class Gemma3Model(Gemma2Model):
         return super().make_rotary_embedding_caches(cos_cache_name=cos_cache_name, sin_cache_name=sin_cache_name)
 
 
+class ErnieModel(MistralModel):
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+
+        # Ernie uses interleaved rotary position embeddings.
+        self.rotemb_attrs["interleaved"] = 1
+
+        # Ernie uses a `compression_ratio` for its RoPE scaling.
+        # The original RoPE logic in ernie is: position_ids / compression_ratio,
+        # which is equivalent to scaling the frequencies (inv_freq) by 1 / compression_ratio.
+        if hasattr(config, "compression_ratio") and config.compression_ratio != 1.0:
+            self.rotemb_attrs["rescale_factors"] = 1.0 / config.compression_ratio
+
+
 def check_extra_options(kv_pairs):
     """
     Check key-value pairs and set values correctly
@@ -3771,6 +3753,8 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
             # Quantized ChatGLM model has ChatGLMForConditionalGeneration as architecture whereas HF model as the latter
             config.hidden_act = "swiglu"
             onnx_model = ChatGLMModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
+        elif config.architectures[0] == "Ernie4_5_ForCausalLM":
+            onnx_model = ErnieModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
         elif config.architectures[0] == "GemmaForCausalLM":
             onnx_model = GemmaModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
         elif config.architectures[0] == "Gemma2ForCausalLM":
@@ -3786,6 +3770,7 @@ def create_model(model_name, input_path, output_dir, precision, execution_provid
             onnx_model.model_type = "gemma3_text"
         elif config.architectures[0] == "Gemma3ForConditionalGeneration":
             print("WARNING: This is only generating the text component of the model. Setting `--extra_options exclude_embeds=true` by default.")
+            extra_options["exclude_embeds"] = True
             text_config = config.text_config
             for key in text_config:
                 if not hasattr(config, key):
