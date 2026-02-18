@@ -72,6 +72,10 @@ DeviceSpan<float> IntermediatePipelineState::Run(int total_length, DeviceSpan<in
         OrtSession::Create(model_.ort_env_, (model_.config_->config_path / fs::path(model_.config_->model.decoder.pipeline[id_].filename)).c_str(),
                            model_.GetSessionOptions(model_.config_->model.decoder.pipeline[id_].model_id));
   }
+
+  if (model_.config_->model.decoder.pipeline[id_].run_options.has_value()) {
+    State::SetRunOptions(model_.config_->model.decoder.pipeline[id_].run_options.value());
+  }
   State::Run(*model_.sessions_[id_]);
   return {};
 }
@@ -345,6 +349,9 @@ DeviceSpan<float> DecoderOnlyPipelineState::Run(int total_length, DeviceSpan<int
 
   UpdateInputsOutputs(next_tokens, next_indices, total_length);
 
+  // first_run_ should be thought of as prompt_processing_run_.
+  // It is true only for the prompt processing part when the provided tokens are more than 1.
+  first_run_ = next_tokens.size() > 1;
   size_t num_chunks{1};
   if (first_run_ && model_.config_->model.decoder.sliding_window.has_value()) {
     int window_size = model_.config_->model.decoder.sliding_window->window_size;

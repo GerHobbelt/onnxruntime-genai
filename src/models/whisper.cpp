@@ -7,14 +7,10 @@ namespace Generators {
 
 WhisperModel::WhisperModel(std::unique_ptr<Config> config, OrtEnv& ort_env)
     : Model{std::move(config)} {
-  // If provider options were explicitly added for the encoder, create session options from this config.
-  if (!config_->model.encoder.session_options.provider_options.empty()) {
-    encoder_session_options_ = OrtSessionOptions::Create();
-    CreateSessionOptionsFromConfig(config_->model.encoder.session_options, *encoder_session_options_, true, false);
-  }
+  encoder_session_options_ = OrtSessionOptions::Create();
+  CreateSessionOptionsFromConfig(config_->model.encoder.session_options.has_value() ? config_->model.encoder.session_options.value() : config_->model.decoder.session_options, *encoder_session_options_, true, false);
 
-  session_encoder_ = CreateSession(ort_env, config_->model.encoder.filename,
-                                   encoder_session_options_ ? encoder_session_options_.get() : session_options_.get());
+  session_encoder_ = CreateSession(ort_env, config_->model.encoder.filename, encoder_session_options_.get());
   session_decoder_ = CreateSession(ort_env, config_->model.decoder.filename, session_options_.get());
 
   session_info_.Add(*session_decoder_);
@@ -48,6 +44,9 @@ void AudioEncoderState::SetExtraInputs(const std::vector<ExtraInput>& extra_inpu
 }
 
 DeviceSpan<float> AudioEncoderState::Run(int current_length, DeviceSpan<int32_t>& next_tokens, DeviceSpan<int32_t> next_indices) {
+  if (model_.config_->model.encoder.run_options.has_value()) {
+    State::SetRunOptions(model_.config_->model.encoder.run_options.value());
+  }
   State::Run(*model_.session_encoder_);
   return {};
 }
@@ -95,7 +94,10 @@ DeviceSpan<float> WhisperDecoderState::Run(int current_length, DeviceSpan<int32_
     output_cross_qk_shape_ = std::array<int64_t, 4>{params_->BatchBeamSize(), model_.config_->model.decoder.num_attention_heads, current_length, num_frames_ / 2};
     output_cross_qk_index_ = outputs_.size();
 
-    for (int i = 0; i < model_.config_->model.decoder.num_hidden_layers; i++) {
+    int num_hidden_layers = model_.config_->model.decoder.num_hidden_layers;
+    output_cross_qk_names_.reserve(num_hidden_layers);
+    output_cross_qk_.reserve(num_hidden_layers);
+    for (int i = 0; i < num_hidden_layers; i++) {
       output_cross_qk_.emplace_back(OrtValue::CreateTensor(model_.p_device_inputs_->GetAllocator(), output_cross_qk_shape_, output_cross_qk_type_));
       output_cross_qk_names_.emplace_back(ComposeKeyValueName(model_.config_->model.decoder.outputs.output_cross_qk_names, i));
 
@@ -104,6 +106,9 @@ DeviceSpan<float> WhisperDecoderState::Run(int current_length, DeviceSpan<int32_
     }
   }
 
+  if (model_.config_->model.decoder.run_options.has_value()) {
+    State::SetRunOptions(model_.config_->model.decoder.run_options.value());
+  }
   State::Run(*model_.session_decoder_);
   return logits_.Get();
 }
