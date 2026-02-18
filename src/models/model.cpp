@@ -1,7 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 //
-// Modifications Copyright(C) 2024-2025 Advanced Micro Devices, Inc. All rights reserved.
+// Modifications Copyright(C) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
 #include <algorithm>
 #include <climits>
 #include <random>
@@ -19,7 +19,11 @@
 #include "multi_modal.h"
 #include "marian.h"
 #include "decoder_only_pipeline.h"
+#include "qwen_vl_model.h"
+#include "qwen2_5_vl_image_processor.h"
 #include "../dml/interface.h"
+#include "../openvino/interface.h"
+#include "../ryzenai/interface.h"
 
 #if defined(_WIN32)
 #include <direct.h>
@@ -167,6 +171,17 @@ void State::SetRunOption(const char* key, const char* value) {
     } else {
       // Value not expected
       throw std::runtime_error(std::string("terminate_session key value unexpected: ") + value);
+    }
+    return;
+  } else if (strcmp(key, "enable_profiling") == 0) {
+    if (strcmp(value, "0") == 0) {
+      run_options_->DisableProfiling();
+    } else {
+      // Enable run-level profiling. The profiling output file is named: <prefix>_<timestamp>.json
+      // Value "1" uses the default prefix; any other value is treated as a custom prefix.
+      constexpr const char* default_profile_prefix = "onnxruntime_run_profile";
+      const char* prefix = (strcmp(value, "1") == 0) ? default_profile_prefix : value;
+      run_options_->EnableProfiling(fs::path(prefix).c_str());
     }
     return;
   }
@@ -504,6 +519,52 @@ void ConfigureNvTensorRtRtxProfile(const Config& config, OrtSessionOptions& sess
   }
 }
 
+namespace {
+
+// Helper to check if a provider is pre-registered and get the matching EP device
+const OrtEpDevice* FindPreRegisteredEpDevice(const std::string& ep_name) {
+  auto device_ptrs = GetOrtEnv().GetEpDevices();
+  auto it = std::find_if(device_ptrs.begin(), device_ptrs.end(),
+                         [&ep_name](const OrtEpDevice* device) {
+                           return device->Name() == ep_name;
+                         });
+  return (it != device_ptrs.end()) ? *it : nullptr;
+}
+
+// Helper to handle pre-registered plugin provider via V2 API
+// Returns true if the provider was pre-registered and handled, false otherwise
+bool IsProviderRegistered(
+    OrtSessionOptions& session_options,
+    const Config::ProviderOptions& provider_options,
+    DeviceType device_type,
+    const std::string& ep_name,
+    bool is_primary_session_options,
+    DeviceInterface*& p_device) {
+  const OrtEpDevice* ep_device = FindPreRegisteredEpDevice(ep_name);
+  if (!ep_device) return false;  // Not pre-registered
+
+  std::unordered_map<std::string, std::string> options;
+  for (auto& option : provider_options.options) {
+    options.insert(option);
+  }
+
+  if (is_primary_session_options) {
+    p_device = GetDeviceInterface(device_type);
+    if (p_device) {
+      void* stream_ptr = p_device->GetCudaStream();
+      std::stringstream stream_value;
+      stream_value << reinterpret_cast<uintptr_t>(stream_ptr);
+      options.insert({"user_compute_stream", stream_value.str()});
+    }
+  }
+
+  std::vector<const OrtEpDevice*> ep_devices_ptrs = {ep_device};
+  session_options.AppendExecutionProvider_V2(GetOrtEnv(), ep_devices_ptrs, options);
+  return true;  // Handled
+}
+
+}  // namespace
+
 DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
                                            const std::vector<std::string>& providers,
                                            const std::vector<Config::ProviderOptions>& provider_options_list,
@@ -532,37 +593,15 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
     const auto& provider_options = *provider_options_it;
 
     if (provider_options.name == "cuda") {
-      auto device_ptrs = GetOrtEnv().GetEpDevices();
-      std::vector<const OrtEpDevice*> cuda_ep_devices_ptrs;
-      for (size_t i = 0; i < device_ptrs.size(); ++i) {
-        if (device_ptrs[i]->Name() == "CUDAExecutionProvider") {
-          // The CUDAExecutionProvider library was registered with the ORT environment
-          // Avoid using the built-in CUDAExecutionProvider by using the V2 API.
-          cuda_ep_devices_ptrs.push_back(device_ptrs[i]);
-          break;
-        }
+      // Try pre-registered plugin path first
+      if (IsProviderRegistered(session_options, provider_options,
+                               DeviceType::CUDA, "CUDAExecutionProvider",
+                               is_primary_session_options, p_device)) {
+        continue;  // Handled via V2 API, skip built-in path
       }
-      if (!cuda_ep_devices_ptrs.empty()) {
-        std::unordered_map<std::string, std::string> options;
-        for (auto& option : provider_options.options) {
-          options.insert(option);
-        }
 
-        // Device type determines the scoring device.
-        // Only use the primary session options to determine the device type
-        if (is_primary_session_options) {
-          p_device = GetDeviceInterface(DeviceType::CUDA);
-
-          // Create and set our cudaStream_t
-          void* stream_ptr = p_device->GetCudaStream();
-          std::stringstream stream_value;
-          stream_value << reinterpret_cast<uintptr_t>(stream_ptr);
-          std::string stream_value_str = stream_value.str();
-          options.insert({"user_compute_stream", stream_value_str});
-        }
-
-        session_options.AppendExecutionProvider_V2(GetOrtEnv(), cuda_ep_devices_ptrs, options);
-      } else {
+      // Built-in CUDA path
+      {
         auto ort_provider_options = OrtCUDAProviderOptionsV2::Create();
         std::vector<const char*> keys, values;
 
@@ -647,7 +686,54 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
 #else
       throw std::runtime_error("DML provider requested, but the installed GenAI has not been built with DML support");
 #endif
-    } else {
+    } else if (provider_options.name == "OpenVINO") {
+      p_device = GetDeviceInterface(DeviceType::OpenVINO);
+      OpenVINO_AppendProviderOptions(session_options, config, provider_options);
+    } else if (provider_options.name == "RyzenAI") {
+      p_device = GetDeviceInterface(DeviceType::RyzenAI);
+
+      session_options.AddConfigEntry("model_root", config.config_path.string().c_str());
+
+      GetRyzenAIInterface()->SetupProvider(session_options, provider_options.options);
+    } else if (provider_options.name == "NvTensorRtRtx") {
+      // Configure NvTensorRT-specific settings (needed for both pre-registered and built-in paths)
+      bool is_multi_profile_enabled = IsMultiProfileEnabled(config.model.decoder.session_options);
+      ConfigureNvTensorRtRtxProfile(config, session_options, is_multi_profile_enabled);
+      if (IsGraphCaptureEnabled(config.model.decoder.session_options)) {
+        session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.enable_cuda_graph", "1");
+      }
+
+      // Try pre-registered plugin path first
+      if (IsProviderRegistered(session_options, provider_options,
+                               DeviceType::NvTensorRtRtx, "NvTensorRTRTXExecutionProvider",
+                               is_primary_session_options, p_device)) {
+        continue;  // Handled via V2 API
+      }
+
+      // Built-in path: Configure stream via config entry (generic AppendExecutionProvider will be called below)
+      if (is_primary_session_options) {
+        p_device = GetDeviceInterface(DeviceType::NvTensorRtRtx);
+        if (p_device) {
+          void* stream_ptr = p_device->GetCudaStream();
+          std::stringstream stream_value;
+          stream_value << reinterpret_cast<uintptr_t>(stream_ptr);
+          std::string stream_value_str = stream_value.str();
+          session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.user_compute_stream", stream_value_str.c_str());
+        }
+      }
+      // Fall through to generic provider registration below
+    }
+
+    // Generic provider registration for all providers not handled by specific blocks above
+    // This handles: QNN, WebGPU, VitisAI, and NvTensorRtRtx (when not pre-registered)
+    // Note: cuda, rocm, DML, OpenVINO and RyzenAI are handled by their own specific blocks above
+    if (provider_options.name != "cuda" && provider_options.name != "rocm" && provider_options.name != "DML" &&
+        provider_options.name != "OpenVINO" && provider_options.name != "RyzenAI") {
+      // Skip if NvTensorRtRtx was already handled via pre-registered plugin
+      if (provider_options.name == "NvTensorRtRtx" && FindPreRegisteredEpDevice("NvTensorRTRTXExecutionProvider")) {
+        continue;
+      }
+
       // For providers that go through the extensible AppendExecutionProvider API:
       if (provider_options.name == "QNN") {
         session_options.AddConfigEntry("ep.share_ep_contexts", "1");
@@ -661,26 +747,10 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
         }
       } else if (provider_options.name == "WebGPU")
         p_device = GetDeviceInterface(DeviceType::WEBGPU);
-      else if (provider_options.name == "OpenVINO")
-        p_device = GetDeviceInterface(DeviceType::OpenVINO);
       else if (provider_options.name == "VitisAI") {
         session_options.AddConfigEntry("session.inter_op.allow_spinning", "0");
         session_options.AddConfigEntry("session.intra_op.allow_spinning", "0");
-      } else if (provider_options.name == "NvTensorRtRtx") {
-        bool is_multi_profile_enabled = IsMultiProfileEnabled(config.model.decoder.session_options);
-        ConfigureNvTensorRtRtxProfile(config, session_options, is_multi_profile_enabled);
-        if (IsGraphCaptureEnabled(config.model.decoder.session_options)) {
-          session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.enable_cuda_graph", "1");
-        }
-        p_device = GetDeviceInterface(DeviceType::NvTensorRtRtx);
-
-        if (is_primary_session_options && p_device) {
-          void* stream_ptr = p_device->GetCudaStream();
-          std::stringstream stream_value;
-          stream_value << reinterpret_cast<uintptr_t>(stream_ptr);
-          std::string stream_value_str = stream_value.str();
-          session_options.AddConfigEntry("ep.nvtensorrtrtxexecutionprovider.user_compute_stream", stream_value_str.c_str());
-        }
+        session_options.AddConfigEntry("model_root", config.config_path.string().c_str());
       }
 
 #if USE_WINML
@@ -693,29 +763,12 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
       std::optional<uint32_t> config_device_id = resolved_device_filtering.hardware_device_id;
       std::optional<uint32_t> config_vendor_id = resolved_device_filtering.hardware_vendor_id;
       std::optional<OrtHardwareDeviceType> config_device_type_enum = resolved_device_filtering.hardware_device_type;
-      // for OpenVINO, use "device_type" in provider_options exclusively if it's provided
-      std::optional<std::string> config_ov_device_type = std::nullopt;
-      if (provider_options.name == "OpenVINO") {
-        for (auto& option : provider_options.options) {
-          if (option.first == "device_type") {
-            config_ov_device_type = option.second;
-          }
-        }
-        if (config_ov_device_type.has_value()) {
-          config_device_id = std::nullopt;
-          config_vendor_id = std::nullopt;
-          config_device_type_enum = std::nullopt;
-        } else if (!(config_device_id.has_value() || config_vendor_id.has_value() || config_device_type_enum.has_value())) {
-          config_ov_device_type = "CPU";
-        }
-      }
 
       // Match EP device with EP name in provider options and model device config
       // include\onnxruntime\core\graph\constants.h
       const static std::unordered_map<std::string, std::string> s_providerNameToExecutionProvider{
           {"QNN", "QNNExecutionProvider"},
           {"WebGPU", "WebGpuExecutionProvider"},
-          {"OpenVINO", "OpenVINOExecutionProvider"},
           {"VitisAI", "VitisAIExecutionProvider"},
           {"NvTensorRtRtx", "NvTensorRTRTXExecutionProvider"},
       };
@@ -737,43 +790,19 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
         const uint32_t hardware_vendor_id = Ort::api->HardwareDevice_VendorId(hardware_device);
         const OrtHardwareDeviceType hardware_device_type = Ort::api->HardwareDevice_Type(hardware_device);
 
-        auto check_ov_device_type = [&config_ov_device_type, &provider_options](const OrtEpDevice* device_ptr) -> bool {
-          if (provider_options.name != "OpenVINO") {
-            return true;
-          } else if (!config_ov_device_type.has_value()) {
-            return true;
-          } else {
-            const OrtKeyValuePairs* keyvals = Ort::api->EpDevice_EpMetadata(device_ptr);
-            size_t num_entries;
-            const char* const* keys = nullptr;
-            const char* const* values = nullptr;
-            Ort::api->GetKeyValuePairs(keyvals, &keys, &values, &num_entries);
-            for (int kvi = 0; kvi < num_entries; kvi++) {
-              const std::string key = keys[kvi];
-              const std::string val = values[kvi];
-              if (key == "ov_device" && val == config_ov_device_type) {
-                return true;
-              }
-            }
-            return false;
-          }
-        };
         bool hardware_device_id_matched = (!config_device_id.has_value()) || config_device_id.value() == hardware_device_id;
         bool hardware_vendor_id_matched = (!config_vendor_id.has_value()) || config_vendor_id.value() == hardware_vendor_id;
         bool hardware_device_type_matched = (!config_device_type_enum.has_value()) ||
                                             config_device_type_enum.value() == hardware_device_type;
-        bool hardware_ov_device_type_matched = check_ov_device_type(device_ptrs[i]);
 
         // Append matched EP device
         if (Ort::api->EpDevice_EpName(device_ptrs[i]) == ep_name &&
             hardware_device_id_matched &&
             hardware_vendor_id_matched &&
-            hardware_device_type_matched &&
-            hardware_ov_device_type_matched) {
+            hardware_device_type_matched) {
           ep_devices_ptrs.push_back(device_ptrs[i]);
           // WinML Hotfix: DML and WebGPU EP factories currently only support one device at a time
-          // OpenVINO also supports only one device at a time
-          if (provider_options.name == "DML" || provider_options.name == "WebGPU" || provider_options.name == "OpenVINO") {
+          if (provider_options.name == "DML" || provider_options.name == "WebGPU") {
             break;
           }
         }
@@ -790,10 +819,6 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
             continue;
           }
 
-          // 'device_type' is not a supported option for OpenVINO when SessionOptionsAppendExecutionProvider_V2 is used.
-          if (provider_options.name == "OpenVINO" && option.first == "device_type") {
-            continue;
-          }
           keys.emplace_back(option.first.c_str());
           values.emplace_back(option.second.c_str());
         }
@@ -803,6 +828,15 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
             &GetOrtEnv(),
             ep_devices_ptrs.data(), ep_devices_ptrs.size(),
             keys.data(), values.data(), keys.size());
+      } else if (provider_options.name == "NvTensorRtRtx") {
+        // Fallback to legacy API for built-in NvTensorRtRtx when no pre-registered device found
+        // This handles the case when using the built-in provider (not loaded as a plugin)
+        std::vector<const char*> keys, values;
+        for (auto& option : provider_options.options) {
+          keys.emplace_back(option.first.c_str());
+          values.emplace_back(option.second.c_str());
+        }
+        session_options.AppendExecutionProvider(provider_options.name.c_str(), keys.data(), values.data(), keys.size());
       }
 #else
       std::vector<const char*> keys, values;
@@ -812,9 +846,26 @@ DeviceInterface* SetProviderSessionOptions(OrtSessionOptions& session_options,
         values.emplace_back(option.second.c_str());
       }
       session_options.AppendExecutionProvider(provider_options.name.c_str(), keys.data(), values.data(), keys.size());
+#if defined(_WIN32)
+      if (provider_options.name == "VitisAI") {
+        if (const auto opt_it = std::find_if(provider_options.options.begin(), provider_options.options.end(),
+                                             [](const auto& pair) { return pair.first == "external_ep_libray"; });
+            opt_it != provider_options.options.end()) {
+          auto lib_name = opt_it->second;
+          auto lib = LoadLibrary(lib_name.c_str());
+          if (const auto func = (void (*)(void*, const OrtApiBase*, void*, OrtEpFactory**, size_t, size_t*))GetProcAddress(lib, "CreateEpFactories")) {
+            OrtEpFactory* factory = nullptr;
+            size_t num = 1;
 
+            func(nullptr, OrtGetApiBase(), nullptr, &factory, num, &num);
+          }
+          fs::path custom_ops_lib_path(lib_name);
+          session_options.RegisterCustomOpsLibrary(custom_ops_lib_path.c_str());
+        }
+      }
+#endif  // WIN32
 #endif
-    }
+    }  // end if (provider not cuda/rocm/DML)
   }
   return p_device;
 }
@@ -851,7 +902,7 @@ void EnsureDeviceOrtInit(DeviceInterface& device, const Config& config, std::uni
   // This ensures memory allocated on-device for model inputs/outputs is valid for the lifetime of GenAI.
 
   // Names for the device types used by 'SetProviderSessionOptions'
-  static const char* device_type_names[] = {"CPU (Not used, see above)", "cuda", "DML", "WebGPU", "QNN", "OpenVINO (Not used, see above)", "NvTensorRtRtx"};
+  static const char* device_type_names[] = {"CPU (Not used, see above)", "cuda", "DML", "WebGPU", "QNN", "OpenVINO (Not used, see above)", "NvTensorRtRtx", "RyzenAI"};
   static_assert(std::size(device_type_names) == static_cast<size_t>(DeviceType::MAX));
 
   // Create an OrtSessionOptions and set the options to use the DeviceType we're using here
@@ -870,7 +921,7 @@ void EnsureDeviceOrtInit(DeviceInterface& device, const Config& config, std::uni
   allocator.session_ = OrtSession::Create(GetOrtEnv(), g_trivial_model, sizeof(g_trivial_model), session_options.get());
 
   // Names for the device memory types used by 'OrtMemoryInfo::Create'
-  static const char* device_memory_type_names[] = {"CPU (Not used, see above)", "Cuda", "DML", "WebGPU_Buffer", "QnnHtpShared", "OpenVINO (Not used, see above)", "Cuda"};
+  static const char* device_memory_type_names[] = {"CPU (Not used, see above)", "Cuda", "DML", "WebGPU_Buf", "QnnHtpShared", "OpenVINO (Not used, see above)", "Cuda", "Cpu"};
   static_assert(std::size(device_memory_type_names) == static_cast<size_t>(DeviceType::MAX));
 
   // Get the allocator from the OrtSession for the DeviceType (it's called 'AllocatorCreate' but it's really 'AllocatorGet')
@@ -934,6 +985,20 @@ std::vector<std::string> SessionInfo::GetInputNames() const {
   return names;
 }
 
+std::vector<int64_t> SessionInfo::GetInputShape(const std::string& name) const {
+  auto type_info = inputs_.find(name);
+  if (type_info == inputs_.end())
+    throw std::runtime_error("Model input was not found: " + name);
+  return type_info->second->GetTensorTypeAndShapeInfo().GetShape();
+}
+
+std::vector<int64_t> SessionInfo::GetOutputShape(const std::string& name) const {
+  auto type_info = outputs_.find(name);
+  if (type_info == outputs_.end())
+    throw std::runtime_error("Model output was not found: " + name);
+  return type_info->second->GetTensorTypeAndShapeInfo().GetShape();
+}
+
 std::vector<const char*> SessionInfo::GetInputSymbolicShape(const std::string& name) const {
   auto type_info = inputs_.find(name);
   if (type_info == inputs_.end())
@@ -952,9 +1017,10 @@ Model::Model(std::unique_ptr<Config> config) : config_{std::move(config)} {
   CreateSessionOptions();
   EnsureDeviceOrtInit(*p_device_, *config_, arena_cfg_);
 
-  // Only CUDA, TRT-RTX and DML does every input on the device
+  // Only CUDA, TRT-RTX, RyzenAI and DML does every input on the device
   // For WebGPU, use device memory only if graph capture is enabled, otherwise use CPU
   if (p_device_->GetType() == DeviceType::CUDA || p_device_->GetType() == DeviceType::DML || p_device_->GetType() == DeviceType::NvTensorRtRtx ||
+      p_device_->GetType() == DeviceType::RyzenAI ||
       (p_device_->GetType() == DeviceType::WEBGPU && IsGraphCaptureEnabled(config_->model.decoder.session_options)))
     p_device_inputs_ = p_device_;
   else
@@ -1183,6 +1249,14 @@ std::shared_ptr<MultiModalProcessor> Model::CreateMultiModalProcessor() const {
   return std::make_shared<MultiModalProcessor>(*config_, session_info_);
 }
 
+bool Model::IsPruned() const {
+  const auto& logits_name = config_->model.decoder.outputs.logits;
+  if (!session_info_.HasOutput(logits_name))
+    return false;
+  const auto logits_shape = session_info_.GetOutputShape(logits_name);
+  return logits_shape[1] == 1;
+}
+
 std::shared_ptr<Model> CreateModel(OrtEnv& ort_env, const char* config_path, const RuntimeSettings* settings /*= nullptr*/) {
   std::string config_overlay;
   if (settings) {
@@ -1193,6 +1267,9 @@ std::shared_ptr<Model> CreateModel(OrtEnv& ort_env, const char* config_path, con
 }
 
 std::shared_ptr<Model> CreateModel(OrtEnv& ort_env, std::unique_ptr<Config> config) {
+  // Check if it's a pipeline model by checking if decoder.pipeline is configured
+  if ((config->model.type == "fara" || config->model.type == "qwen2_5_vl") && !config->model.decoder.pipeline.empty())
+    return std::make_shared<Qwen2_5_VL_PipelineModel>(std::move(config), ort_env);
   if (config->model.type == "gpt2")
     return std::make_shared<Gpt_Model>(std::move(config), ort_env);
   if (ModelType::IsLLM(config->model.type))
@@ -1288,7 +1365,9 @@ MultiModalProcessor::MultiModalProcessor(Config& config, const SessionInfo& sess
           {"phi3v", Processor::Create<PhiImageProcessor>},
           {"whisper", Processor::Create<WhisperProcessor>},
           {"phi4mm", Processor::Create<PhiMultiModalProcessor>},
-          {"gemma3", Processor::Create<GemmaImageProcessor>}} {
+          {"gemma3", Processor::Create<GemmaImageProcessor>},
+          {"fara", Processor::Create<QwenImageProcessor>},
+          {"qwen2_5_vl", Processor::Create<QwenImageProcessor>}} {
   auto processor = processor_factory_.find(config.model.type);
   if (processor != processor_factory_.end()) {
     processor_ = processor->second(config, session_info);

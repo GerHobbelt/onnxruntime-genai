@@ -3,7 +3,7 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 #
-# Copyright(C) 2024 Advanced Micro Devices, Inc. All rights reserved.
+# Copyright (C)  [2026]  Advanced Micro Devices, Inc. All rights reserved. Portions of this file consist of AI generated content.
 # --------------------------------------------------------------------------
 from __future__ import annotations
 
@@ -358,12 +358,27 @@ class Model:
         # Quantization-specific variables (INT4, INT8, etc.)
         int4_algo_config = self.make_int4_algo_config(extra_options.get("int4_algo_config", "default"))
         self.int4_block_size = extra_options.get("int4_block_size", 32)
+
+        # CPU, WebGPU, and TRT-RTX support block-wise quantization for QMoE.
+        # TRT-RTX defaults to 128; others default to 32 for consistency with MatMulNBits.
+        supported_blockwise_eps = ["cpu", "webgpu", "trt-rtx"]
+        default_qmoe_block_size = 128 if self.ep == "trt-rtx" else 32
+        self.qmoe_block_size = int(extra_options.get("qmoe_block_size", default_qmoe_block_size))
+
+        # Validate that unsupported EPs don't explicitly request block-wise quantization
+        if self.ep not in supported_blockwise_eps and "qmoe_block_size" in extra_options and moe_op_type == "QMoE":
+            raise ValueError(
+                f"The 'qmoe_block_size' option is not supported for {self.ep} execution provider with QMoE. "
+                f"Block-wise quantization is only supported for: {', '.join(supported_blockwise_eps)}."
+            )
+
         self.quant_attrs = {
             "int4": {
                 "accuracy_level": int(
                     extra_options.get("int4_accuracy_level", 4 if self.ep in ["cpu", "webgpu"] else 0)
                 ),
-                "block_size": int(self.int4_block_size),
+                "qmoe_block_size": int(self.qmoe_block_size),
+                "qdq_block_size": int(self.int4_block_size),
                 "is_symmetric": extra_options.get("int4_is_symmetric", True),
                 "op_types_to_quantize": extra_options.get("int4_op_types_to_quantize", ("MatMul",)),
                 "nodes_to_exclude": extra_options.get("int4_nodes_to_exclude", []),
@@ -371,6 +386,12 @@ class Model:
             },
             "use_qdq": extra_options.get("use_qdq", False),
         }
+
+        # Propagate block_size to MoE/QMoE op when supported.
+        # QMoE on supported EPs uses block-wise quantization via the 'block_size' attribute.
+        # Ensure the attribute is set on the MoE op so runtime kernels can honor it.
+        if self.moe_attrs.get("op_type") == "QMoE" and self.ep in supported_blockwise_eps:
+            self.moe_attrs["block_size"] = int(self.qmoe_block_size)
         if self.quant_type is not None:
             # Create quantized attributes from quantization config
             self.quant_attrs["config"] = config.quantization_config
@@ -472,8 +493,13 @@ class Model:
                 "ntk_alpha": beta_slow,
                 "ntk_beta": beta_fast,
             }
+        elif "mrope_section" in config.rope_scaling:
+            # For models that use MRoPE (e.g. Qwen 2.5 VL)
+            self.rope_attrs["mrope"] = {
+                "sections": config.rope_scaling["mrope_section"],  # Sections for MRoPE
+            }
 
-    def make_attention_init(self):
+    def is_gqa_supported(self) -> bool:
         valid_gqa_configurations = {
             ("cpu", ir.DataType.FLOAT),
             ("cuda", ir.DataType.FLOAT16),
@@ -482,8 +508,12 @@ class Model:
             ("webgpu", ir.DataType.FLOAT16),
             ("webgpu", ir.DataType.FLOAT),
             ("trt-rtx", ir.DataType.FLOAT16),
+            ("trt-rtx", ir.DataType.BFLOAT16),
         }
-        if (self.ep, self.io_dtype) in valid_gqa_configurations:
+        return (self.ep, self.io_dtype) in valid_gqa_configurations
+
+    def make_attention_init(self):
+        if self.is_gqa_supported():
             # Change model settings for GroupQueryAttention
             self.attention_attrs["op_type"] = "GroupQueryAttention"
             print("GroupQueryAttention (GQA) is used in this model.")
@@ -529,7 +559,7 @@ class Model:
             }
             for key, default_val in defaults.items():
                 val = getattr(gen_config, key)
-                if val != default_val:
+                if val is not None and val != default_val:
                     setattr(config, key, getattr(gen_config, key))
         except:
             pass
@@ -601,8 +631,8 @@ class Model:
                 else self.past_present_share_buffer,
                 "repetition_penalty": config.repetition_penalty if hasattr(config, "repetition_penalty") else 1.0,
                 "temperature": config.temperature if hasattr(config, "temperature") else 1.0,
-                "top_k": config.top_k if hasattr(config, "top_k") else 50,
-                "top_p": config.top_p if hasattr(config, "top_p") else 1.0,
+                "top_k": config.top_k if hasattr(config, "top_k") and config.top_k is not None else 50,
+                "top_p": config.top_p if hasattr(config, "top_p") and config.top_p is not None else 1.0,
             },
         }
 
@@ -641,6 +671,9 @@ class Model:
         tokenizer = AutoTokenizer.from_pretrained(
             model_name_or_path, token=self.hf_token, trust_remote_code=self.hf_remote, **extra_kwargs
         )
+        # Overwrite model_max_length with the model's context_length so it is a normal integer
+        # (HF often uses 1e30 for "no limit", which can serialize to a huge decimal in JSON)
+        tokenizer.model_max_length = self.context_length
         print(f"Saving processing files in {out_dir} for GenAI")
         tokenizer.save_pretrained(out_dir)
 
@@ -681,7 +714,7 @@ class Model:
     def to_int4(self) -> ir.Model:
         quant = MatMulNBitsQuantizer(
             model=ir.to_proto(self.model),
-            block_size=self.quant_attrs["int4"]["block_size"],
+            block_size=self.quant_attrs["int4"]["qdq_block_size"],
             is_symmetric=self.quant_attrs["int4"]["is_symmetric"],
             accuracy_level=self.quant_attrs["int4"]["accuracy_level"],
             nodes_to_exclude=self.quant_attrs["int4"]["nodes_to_exclude"],
@@ -1302,9 +1335,12 @@ class Model:
             self.make_reshape(
                 weight_reshape_name, weight_reshape_inputs, dtype=ir.DataType.UINT8, shape=[self.vocab_size, flat_dim]
             )
+            input_names = [weight_reshape_output, "input_ids", "lm_head.MatMul.weight_scale"];
+            if not self.quant_attrs["int4"]["is_symmetric"]:
+                input_names.append("lm_head.MatMul.weight_zp")
             self.make_node(
                 "GatherBlockQuantized",
-                inputs=[weight_reshape_output, "input_ids", "lm_head.MatMul.weight_scale", "lm_head.MatMul.weight_zp"],
+                inputs=input_names,
                 outputs=[gather_output],
                 name=gather_name,
                 domain="com.microsoft",
@@ -1946,6 +1982,7 @@ class Model:
                 sin_cache_small_name=sin_cache_small_name,
                 small_cache_shape=cos_cache_large.shape,
             )
+            self.ep_attrs["trt-rtx"]["enable_cuda_graph"] = "0"
             return
 
         # For other EPs (CUDA, CPU, WebGPU), create regular If node with multiple outputs
@@ -2684,7 +2721,11 @@ class Model:
         #                O_MatMul
         #                    |
         #                  O_Add
+        self.make_attention_input_proj(layer_id, attention, root_input, **kwargs)
+        self.make_attention_qk_subgraph(layer_id, attention, root_input, **kwargs)
+        self.make_attention_output_proj(layer_id, attention, root_input, **kwargs)
 
+    def make_attention_input_proj(self, layer_id, attention, root_input, **kwargs):
         # Unpack attention weights if needed
         self.make_attention_unpacked(layer_id, attention, root_input, **kwargs)
 
@@ -2748,6 +2789,7 @@ class Model:
                 self.make_add_bias(attention.v_proj.bias, v_add_name, root_input=self.attention_attrs["v_path"])
                 self.attention_attrs["v_path"] = f"{v_add_name}/output_0"
 
+    def make_attention_qk_subgraph(self, layer_id, attention, root_input, **kwargs):
         # Make Q/K SimplifiedLayerNorm nodes
         if self.attention_attrs["q_norm"] and self.attention_attrs["k_norm"]:
             self.make_qk_norm(layer_id, attention)
@@ -2809,11 +2851,15 @@ class Model:
             **kwargs,
         )
 
+    def make_attention_output_proj(self, layer_id, attention, root_input, **kwargs):
+        attn_name = f"/model/layers.{layer_id}/attn/{self.attention_attrs['op_type']}"
+        attn_output = f"{attn_name}/output_0"
+
         # Make MatMul node (output projection weight node)
         o_proj = "o_proj" if hasattr(attention, "o_proj") else "dense"
         o_matmul_basename = f"/model/layers.{layer_id}/attn/o_proj/MatMul"
         o_weight = getattr(attention, o_proj)
-        o_matmul_name = self.make_matmul(o_weight, o_matmul_basename, f"{attn_name}/output_0")
+        o_matmul_name = self.make_matmul(o_weight, o_matmul_basename, attn_output)
 
         # Make Add node (output projection bias node if bias exists)
         o_bias_exists = getattr(attention, o_proj).bias is not None
@@ -3196,11 +3242,26 @@ class Model:
             kwargs.get("scales3", ""),
             kwargs.get("bias3", ""),
         ]
+
+        # TRT-RTX doesn't support zero_points inputs at all
+        # For other EPs, always include as optional inputs (even empty strings)
+        if self.ep != "trt-rtx":
+            inputs.extend([
+                kwargs.get("zero_points1", ""),
+                kwargs.get("zero_points2", ""),
+                kwargs.get("zero_points3", ""),
+            ])
+
         output = f"{name}/output_0"
 
         extra_kwargs = (
             {"swiglu_limit": self.moe_attrs["swiglu_limit"]} if self.moe_attrs["swiglu_limit"] is not None else {}
         )
+
+        # Only include block_size attribute if it was set
+        if "block_size" in self.moe_attrs:
+            extra_kwargs["block_size"] = self.moe_attrs["block_size"]
+
         self.make_node(
             "QMoE",
             inputs=inputs,
@@ -3215,7 +3276,6 @@ class Model:
             normalize_routing_weights=self.moe_attrs["normalize_routing_weights"],
             swiglu_fusion=self.moe_attrs["swiglu_fusion"],
             use_sparse_mixer=self.moe_attrs["use_sparse_mixer"],
-            block_size=self.moe_attrs["block_size"],
             **extra_kwargs,
         )
         self.make_value(output, self.io_dtype, shape=["batch_size", "sequence_length", self.hidden_size])
@@ -3224,20 +3284,22 @@ class Model:
         dtype = torch.quint4x2 if self.moe_attrs["expert_weight_bits"] == 4 else torch.int8
         qweight, scales = None, None
 
-        # Get block size from quantization attributes
-        block_size = self.quant_attrs["int4"]["block_size"]
+        # Use block-wise quantization for supported EPs when qmoe_block_size > 0.
+        # TRT-RTX defaults to 128; others default to 32.
+        supported_blockwise_eps = ["cpu", "webgpu", "trt-rtx"]
+        use_blockwise_quant = self.ep in supported_blockwise_eps and self.qmoe_block_size > 0
 
-        # Use block-wise quantization if block_size > 0
-        if block_size > 0:
+        if use_blockwise_quant:
+            block_size = self.quant_attrs["int4"]["qmoe_block_size"]
             try:
                 qweight, scales = self._symmetric_blockwise_quantize(weights, block_size)
                 self.moe_attrs["block_size"] = block_size
                 return qweight, scales.to(torch.float16)
             except Exception as e:
                 raise RuntimeError(f"Block-wise quantization failed with block_size={block_size}: {e}")
-        else:
-            # block_size is 0, so we're using tensor-level quantization
-            self.moe_attrs["block_size"] = 0
+
+        # Use tensor-level quantization (default for QMoE on CPU/WebGPU when not explicitly requested)
+        self.moe_attrs["block_size"] = 0
 
         # Existing tensor-level quantization implementation (fallback)
         unsuccessful = True
@@ -3312,6 +3374,7 @@ class Model:
 
             quantized_flat = quantized_int8.view(*original_shape[:-1], num_blocks * block_size)
 
+            # remove padding
             if pad_size > 0:
                 quantized_flat = quantized_flat[..., :-pad_size]
 
@@ -3664,13 +3727,7 @@ class Model:
             # Norm after last decoder layer of model (last layer --> norm)
             self.layernorm_attrs["last_layernorm"] = True
 
-    def make_model(self, input_path):
-        # Make inputs and outputs to ONNX model
-        self.make_inputs_and_outputs()
-
-        # Make pre-processing nodes
-        self.make_preprocessing_nodes()
-
+    def load_weights(self, input_path):
         # Load weights of original model
         if input_path.endswith(".gguf"):
             # Load GGUF model
@@ -3707,7 +3764,6 @@ class Model:
                 intermediate_size=self.intermediate_size,
                 num_layers=self.num_layers,
             )
-
         else:
             # Load PyTorch model
             extra_kwargs = {"num_hidden_layers": self.num_layers} if "num_hidden_layers" in self.extra_options else {}
@@ -3725,6 +3781,17 @@ class Model:
             model = PeftModel.from_pretrained(
                 model, self.extra_options["adapter_path"], cache_dir=self.cache_dir, token=self.hf_token
             )
+
+        return model
+
+    def make_model(self, input_path):
+        # Make inputs and outputs to ONNX model
+        self.make_inputs_and_outputs()
+
+        # Make pre-processing nodes
+        self.make_preprocessing_nodes()
+
+        model = self.load_weights(input_path)
 
         # Loop through model and map each module to ONNX/ORT ops
         self.layer_id = 0

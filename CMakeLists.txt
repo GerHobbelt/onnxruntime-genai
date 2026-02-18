@@ -191,7 +191,17 @@ if((USE_CUDA OR USE_TRT_RTX) AND CMAKE_CUDA_COMPILER)
     $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>
   )
   
-  add_library(onnxruntime-genai-cuda SHARED ${generator_cudalib_srcs})
+  if(WIN32)
+    add_library(onnxruntime-genai-cuda SHARED ${generator_cudalib_srcs} "${GENERATORS_ROOT}/dll/onnxruntime-genai.rc")
+    target_compile_definitions(onnxruntime-genai-cuda PRIVATE VERSION_INFO=\"${VERSION_INFO}\")
+    target_compile_definitions(onnxruntime-genai-cuda PRIVATE VERSION_MAJOR=${VERSION_MAJOR})
+    target_compile_definitions(onnxruntime-genai-cuda PRIVATE VERSION_MINOR=${VERSION_MINOR})
+    target_compile_definitions(onnxruntime-genai-cuda PRIVATE VERSION_PATCH=${VERSION_PATCH})
+    target_compile_definitions(onnxruntime-genai-cuda PRIVATE VERSION_SUFFIX=${VERSION_SUFFIX})
+    target_compile_definitions(onnxruntime-genai-cuda PRIVATE FILE_NAME=\"onnxruntime-genai-cuda.dll\")
+  else()
+    add_library(onnxruntime-genai-cuda SHARED ${generator_cudalib_srcs})
+  endif()
   target_include_directories(onnxruntime-genai-cuda PRIVATE ${ORT_HEADER_DIR})
   target_include_directories(onnxruntime-genai-cuda PRIVATE ${GENERATORS_ROOT})
   target_link_libraries(onnxruntime-genai-cuda PRIVATE cublasLt cublas curand cufft cudart)
@@ -226,7 +236,7 @@ endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   set_target_properties(onnxruntime-genai PROPERTIES POSITION_INDEPENDENT_CODE ON)
-  target_link_libraries(onnxruntime-genai PRIVATE dl)  # For dlopen & co
+  target_link_libraries(onnxruntime-genai PUBLIC dl)  # For dlopen & co
 endif()
 
 if(USE_DML)
@@ -269,6 +279,11 @@ if(ANDROID)
   # strip the binary if it's not a build with debug info
   set_target_properties(onnxruntime-genai PROPERTIES LINK_FLAGS_RELEASE -s)
   set_target_properties(onnxruntime-genai PROPERTIES LINK_FLAGS_MINSIZEREL -s)
+
+  # Build shared libraries with support for 16 KB page size on Android
+  # https://source.android.com/docs/core/architecture/16kb-page-size/16kb#build-lib-16kb-alignment
+  set(CMAKE_SHARED_LINKER_FLAGS "${CMAKE_SHARED_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
+  set(CMAKE_MODULE_LINKER_FLAGS "${CMAKE_MODULE_LINKER_FLAGS} -Wl,-z,max-page-size=16384")
 endif()
 
 if(ENABLE_TESTS)
