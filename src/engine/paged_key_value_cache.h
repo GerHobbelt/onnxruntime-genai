@@ -34,6 +34,15 @@ inline size_t GetGraphBlockTableColumns(size_t max_blocks, size_t max_columns) {
   return columns;
 }
 
+size_t ComputePagedBlockCapacity(size_t available_memory_bytes,
+                                 float gpu_utilization_factor,
+                                 size_t reserved_memory_bytes,
+                                 size_t block_size,
+                                 size_t num_key_value_heads,
+                                 size_t head_size,
+                                 size_t full_layer_count,
+                                 size_t element_size);
+
 /*
  * PagedKeyValueCache manages a paged key-value cache for models that use the PagedAttention operator.
  * The cache is divided into blocks, each containing a fixed number of slots. Each slot holds
@@ -46,7 +55,7 @@ inline size_t GetGraphBlockTableColumns(size_t max_blocks, size_t max_columns) {
  */
 struct PagedKeyValueCache {
  public:
-  PagedKeyValueCache(std::shared_ptr<Model> model);
+  explicit PagedKeyValueCache(std::shared_ptr<Model> model);
 
   bool CanAdd(std::shared_ptr<Request> request) const;
 
@@ -57,6 +66,10 @@ struct PagedKeyValueCache {
   void AppendTokens(std::shared_ptr<Request> request);
 
   void Remove(std::shared_ptr<Request> request);
+  void ValidateRemove(const void* request_id) const;
+  void RemoveValidated(const void* request_id) noexcept;
+  bool OwnsRequest(const void* request_id) const noexcept;
+  size_t CommittedSlots(const void* request_id) const;
 
   PagedCacheReservation Reserve(std::span<const PagedCacheReservationRequest> requests);
 
@@ -171,11 +184,13 @@ struct PagedKeyValueCache {
   // Fills `data` with `columns` block ids per request, in the order the requests were given.
   void FillBlockTables(const std::vector<std::shared_ptr<Request>>& requests, bool windowed,
                        int32_t* data, size_t columns);
+  void RebuildBlockTableIndex() noexcept;
   std::shared_ptr<Model> model_;
   std::vector<LayerCache> cache_;                   // Pair of key and value caches for all layers
   std::unique_ptr<BlockPool> block_pool_;           // Allocator for blocks
   std::vector<PagedCacheBlockTable> block_tables_;  // Block table for all requests in the cache
-  std::unique_ptr<OrtValue> block_tables_value_;    // Block tables for all requests in the cache
+  std::unique_ptr<RequestIndex> block_table_index_;
+  std::unique_ptr<OrtValue> block_tables_value_;  // Block tables for all requests in the cache
 
   // Sliding-window layers hold their KV in a ring of `window_ring_blocks_` blocks rather than one
   // block per position, so they get their own much smaller pool and their own block table. The

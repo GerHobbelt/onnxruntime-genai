@@ -3,7 +3,9 @@
 
 #pragma once
 
-#include "../generators.h"
+#include <array>
+
+#include "generator/generators.h"
 #include "request_status.h"
 #include "engine_invariants.h"
 #include "step_plan.h"
@@ -16,24 +18,45 @@
 
 namespace Generators {
 
+namespace test {
+struct RequestGuidanceTestAccess;
+}
+
 struct Request;
 struct ScheduledRequests;
-struct StaticBatchScheduler;
 
-template <>
-struct ExternalRefCountedTraits<Request> {
-  static constexpr bool notify_external_reference_changes = true;
+struct RequestOptions {
+  std::optional<size_t> max_session_tokens;
+};
+
+struct TurnOptions {
+  std::weak_ptr<Request> request;
+  std::optional<size_t> max_generated_tokens;
+
+  void ValidateOwnerThread() const;
 };
 
 struct RequestStepResult {
   int32_t token{};
   bool token_appended{};
   bool done{};
+  GenerationFinishReason finish_reason{GenerationFinishReason::None};
+  std::array<int32_t, kMaxGeneratedTokensPerStep> visible_tokens{};
+  size_t visible_token_count{};
 };
 
-// Every Engine Request has one sequence and one beam, so a chunk-complete step can append at most
-// one generated-output index.
-inline constexpr size_t kMaxGeneratedTokenIndicesPerStep = 1;
+struct RequestTurnAdmission {
+  RequestStatus status{RequestStatus::Unassigned};
+  size_t host_token_count{};
+  int64_t prompt_sequence_length{};
+  int64_t processed_sequence_length{};
+  bool transaction_started{};
+};
+
+struct RequestTurnCounters {
+  uint64_t prompt_tokens{};
+  uint64_t generated_tokens{};
+};
 
 /**
  * @class Request
@@ -52,55 +75,49 @@ struct Request : std::enable_shared_from_this<Request>,
    * @brief Constructs a Request object with the given generator parameters.
    * @param params Shared pointer to GeneratorParams containing generation configuration.
    */
-  Request(std::shared_ptr<GeneratorParams> params);
+  Request(
+      std::shared_ptr<GeneratorParams> params,
+      size_t max_total_tokens,
+      std::shared_ptr<std::atomic<bool>> abandonment_pending =
+          std::make_shared<std::atomic<bool>>(false));
   ~Request();
-
-  /**
-   * @brief Assigns this request to a specific engine for processing.
-   * @param engine Shared pointer to the Engine to be used for processing this request.
-   *
-   * Once assigned, the request will finalize the prefill tokens and prepare for scheduling.
-   */
-  void Assign(std::shared_ptr<Engine> engine);
 
   /**
    * @brief Updates the status of the request to Active and prepares it for processing.
    */
   void Schedule();
 
-  /**
-   * @brief Adds initial input tokens before the request is submitted to an Engine.
-   * @param tokens Span of token IDs to be added.
-   *
-   * This operation is legal only while the request is Unassigned. Use Continue()
-   * to begin another turn after the current turn reaches TurnComplete.
-   */
-  void AddTokens(std::span<const int32_t> tokens);
-
-  /**
-   * @brief Queues another generation turn using resident model state.
-   * @param tokens New input tokens to append after the completed turn.
-   *
-   * This operation is legal only from TurnComplete. It preserves unread generated
-   * output, appends no input tokens to that output stream, and moves the request
-   * back to Assigned (the queued state).
-   */
-  void Continue(std::span<const int32_t> tokens);
-
-  /**
-   * @brief Retrieves the next unseen token in the request.
-   * @return The next unseen token ID.
-   *
-   * Newly generated tokens that have not been decoded by the calling application.
-   * Applications looking to stream decode should call this method to get the next token
-   *
-   * while request.HasUnseenTokens():
-   *     token = request.UnseenToken();
-   *
-   * Once an unseen token is seen, it is marked as seen and will not show up in
-   * subsequent calls to this method.
-   */
-  int32_t UnseenToken();
+  uint64_t BeginTurn(
+      std::span<const int32_t> tokens,
+      std::optional<size_t> max_generated_tokens = std::nullopt);
+  void ValidateOwnerThread() const;
+  void AttachToEngine(std::shared_ptr<Engine> engine) noexcept;
+  bool BelongsTo(const Engine& engine) const noexcept;
+  bool IsAwaitingFirstTurn() const noexcept;
+  bool IsRestartableCanceledTurn() const noexcept;
+  void ValidateTurnAdmission(
+      std::span<const int32_t> tokens,
+      std::optional<size_t> max_generated_tokens) const;
+  void ValidateContinuousDecodingSupport() const;
+  void PrepareTurnAdmission(
+      std::span<const int32_t> tokens,
+      RequestTurnAdmission& admission);
+  uint64_t CommitTurnAdmission(
+      std::optional<size_t> max_generated_tokens,
+      RequestTurnAdmission& admission);
+  void RollbackTurnAdmission(RequestTurnAdmission& admission);
+  bool CanCancelFromEngine(
+      const Engine& engine,
+      uint64_t turn_id) const;
+  RequestTurnCounters CompleteCancelFromEngine(
+      const Engine& engine,
+      uint64_t turn_id) noexcept;
+  // Publishes logical close without destroying runtime state that a resident static row still
+  // needs. CompleteCloseFromEngine finishes both logical and physical close.
+  void MarkClosedFromEngine(const Engine& engine) noexcept;
+  void CompleteCloseFromEngine(const Engine& engine) noexcept;
+  void MarkFailedFromEngine(const Engine& engine) noexcept;
+  void CompleteFailedTurnFromEngine(const Engine& engine) noexcept;
 
   /**
    * @brief Returns a span of unprocessed tokens on the device.
@@ -114,7 +131,7 @@ struct Request : std::enable_shared_from_this<Request>,
   /**
    * @brief Returns the unprocessed tokens from the host-side mirror of the sequence.
    * @return Span of unprocessed token IDs, valid only until the next call that appends to the
-   *         sequence (CommitStep, CompleteGeneration, Continue, or Assign). Copy it if it must
+   *         sequence (CommitStep, CompleteGeneration, or BeginTurn). Copy it if it must
    *         outlive those.
    *
    * Same tokens as UnprocessedTokens(), but readable without copying them back from the device.
@@ -124,12 +141,6 @@ struct Request : std::enable_shared_from_this<Request>,
   std::span<const int32_t> UnprocessedTokensCpu() const;
 
   /**
-   * @brief Checks if there are any unseen tokens in the request.
-   * @return True if there are unseen tokens, false otherwise.
-   */
-  bool HasUnseenTokens() const;
-
-  /**
    * @brief Launches the generation of the next token based on the provided logits.
    * @param logits DeviceSpan containing logits for token generation.
    *
@@ -137,15 +148,54 @@ struct Request : std::enable_shared_from_this<Request>,
    * results and to update the request status. Splitting the two lets the engine launch every
    * scheduled request's token selection before it synchronizes with the device once.
    */
-  void GenerateNextTokens(DeviceSpan<float> logits);
+  void GenerateNextTokens(DeviceSpan<float> logits, bool guidance_applied = false);
+
+  /**
+   * @brief Proposes speculative draft tokens for this request's next step.
+   * @param tokens Draft continuation of the sequence, in order. An empty span clears the proposal.
+   *
+   * The request must be ready to decode. The next step then runs 1 + tokens.size() rows, verifies
+   * each draft against the target model's own prediction, and keeps the accepted prefix. Only
+   * greedy requests may propose drafts, because verification compares argmax tokens rather than
+   * sampling probabilities.
+   *
+   * The proposal applies to the current turn's next committed decode step. A rolled back step
+   * leaves it pending, while canceling the turn discards it.
+   */
+  void SetDraftTokens(std::span<const int32_t> tokens);
+
+  /**
+   * @brief Draft tokens proposed for the next step but not yet sent through the model.
+   */
+  size_t PendingDraftTokenCount() const noexcept { return draft_tokens_.size(); }
+
+  /**
+   * @brief Drafts of the step in flight that the target model accepted.
+   */
+  size_t AcceptedDraftTokenCount() const noexcept { return accepted_draft_count_; }
+
+  /**
+   * @brief Sequence length excluding any drafts staged by the step in flight.
+   */
+  int64_t CommittedSequenceLength() const;
+
+  void AppendDraftsForTransaction(size_t draft_count);
+  std::span<const int32_t> StagedDraftTokens() const;
+  void CommitAcceptedDraftsForTransaction(size_t accepted_count);
+  bool DraftVerificationCompletedGeneration() const noexcept {
+    return draft_verification_completed_generation_;
+  }
 
   void ValidateEngineCompatibility() const;
   void SaveStateForTransaction();
   void SaveStateForExternalSamplingTransaction();
-  RequestStepResult ApplyLogitsForTransaction(DeviceSpan<float> logits);
-  void PrepareGenerationForTransaction(DeviceSpan<float> logits);
+  RequestStepResult ApplyLogitsForTransaction(DeviceSpan<float> logits,
+                                              bool guidance_applied = false);
+  void PrepareGenerationForTransaction(DeviceSpan<float> logits,
+                                       bool guidance_applied = false);
   RequestStepResult StageGenerationForTransaction(
       const RequestStepPlan& plan);
+  RequestStepResult StageDraftCompletionForTransaction();
   void RestoreStateForTransaction();
   void QueueStateRestoreForTransaction();
   void CompleteStateRestoreForTransaction();
@@ -158,20 +208,23 @@ struct Request : std::enable_shared_from_this<Request>,
    *
    * Updates the host-side token mirror and the request status.
    */
-  void CompleteGeneration();
+  RequestStepResult CompleteGeneration();
 
   /**
    * @brief Checks if the current generation turn reached a stopping condition.
    * @return True in TurnComplete; the request may still be continued or closed.
    */
   bool IsTurnComplete() const;
+  uint64_t CurrentTurnId() const noexcept { return current_turn_id_; }
+  bool HasCurrentTurn() const noexcept { return has_current_turn_; }
+  GenerationFinishReason FinishReason() const noexcept { return finish_reason_; }
+  size_t TurnPromptTokens() const noexcept { return turn_prompt_tokens_; }
+  size_t TurnGeneratedTokens() const noexcept { return turn_generated_tokens_; }
 
   RequestStatus Status() const noexcept { return status_; }
 
-  /**
-   * @brief Removes the request from its engine and moves it to terminal Closed.
-   */
-  void Remove();
+  void Close();
+  bool Cancel(uint64_t turn_id);
 
   /**
    * @brief Checks if the request is in prefill mode.
@@ -261,7 +314,9 @@ struct Request : std::enable_shared_from_this<Request>,
    * @brief Runs everything token selection needs before the sampler: sequence bookkeeping,
    *        handing the logits to the search, and applying the logits processors.
    */
-  void PrepareGeneration(DeviceSpan<float> logits);
+  void PrepareGeneration(DeviceSpan<float> logits, bool guidance_applied = false);
+  bool HasGuidance() const { return guidance_logits_processor_ != nullptr; }
+  std::span<const uint32_t> GetReadyGuidanceMask();
 
   /**
    * @brief Launches the per-sequence tail after a batched sampler has filled the bound slot.
@@ -272,63 +327,49 @@ struct Request : std::enable_shared_from_this<Request>,
    * @brief Returns this request's persistent random state for the given batched sampler.
    */
   BatchedSamplerState& SamplingState(BatchedSampler& sampler);
-
-  /**
-   * @brief Retrieves the generator parameters associated with this request.
-   * @return Shared pointer to GeneratorParams.
-   */
-  std::shared_ptr<GeneratorParams> Params();
-
-  /**
-   * @brief Sets the opaque data for user-defined purposes.
-   * @param data Pointer to the opaque data.
-   *
-   * This data can be used by the application to store additional information
-   * that may be useful for the application logic when new tokens are generated.
-   * For example, the application could store a pointer to a user-defined structure
-   * that contains the state of the application related to this request.
-   * The data can be retrieved later using GetOpaqueData(). The stored data is not
-   * used by the request or the engine and is solely for the application's use.
-   * It is the application's responsibility to manage the lifetime of this data.
-   */
-  void SetOpaqueData(void* data);
-
-  /**
-   * @brief Gets the opaque data set by the user.
-   * @return Pointer to the opaque data provided by the application.
-   */
-  void* GetOpaqueData();
+  void CommitSamplingState(std::unique_ptr<BatchedSamplerState> state) noexcept;
 
  private:
   // The search sequence is partitioned at processed_sequence_length_: tokens before it already
   // have KV entries, and UnprocessedTokens() returns the scheduled prefix of [processed, current).
-  // seen_sequence_length_ is the high-water sequence index of generated output consumed by the
-  // application. Continuation input creates gaps, so it is not an unseen-token count.
-  std::vector<int32_t> prefill_input_ids_;
   // Host-side mirror of the full sequence (prompt + generated tokens). Kept in step with the
   // search's device sequence so that streaming and input-id preparation never read it back.
   std::vector<int32_t> tokens_host_;
-  std::vector<size_t> unseen_token_indices_;
-  size_t next_unseen_token_index_{};
-  int64_t seen_sequence_length_{};
-  friend struct Engine;
-  friend struct ExternalRefCounted<Request>;
   friend struct ScheduledRequests;
-  friend struct StaticBatchScheduler;
+  friend struct test::RequestGuidanceTestAccess;
 
-  void CompleteClose();
-  void OnFirstExternalReference() noexcept;
-  void OnLastExternalReference() noexcept;
-  bool IsExternallyAbandoned() const noexcept;
-  // Runs before a scheduled step can execute. It keeps only useful consumed-prefix storage and
-  // reserves every unseen-index append that the step can perform, so CommitStep stays noexcept.
-  void PrepareForStep(size_t max_generated_token_indices);
+  void CompleteClose() noexcept;
+  static DeviceSpan<int32_t> AllocateOnDevice(
+      GeneratorParams& params,
+      std::span<const int32_t> input_ids);
+  static void ValidateAppendLength(
+      size_t max_total_tokens,
+      size_t current_sequence_length,
+      size_t token_count);
+  // Drops whatever the step in flight staged past the committed sequence, leaving the host mirror
+  // exactly as long as the search after its own transaction rewind.
+  void DiscardStagedDrafts() noexcept;
 
   int64_t processed_sequence_length_{};
   // Sequence length the application's tokens reach up to. Everything below it is prompt, so the
   // request is still prefilling while processed_sequence_length_ has not caught up with it.
   int64_t prompt_sequence_length_{};
   size_t scheduled_token_count_{};
+  std::optional<size_t> turn_max_generated_tokens_;
+  size_t turn_prompt_tokens_{};
+  size_t turn_generated_tokens_{};
+  const size_t max_total_tokens_;
+  uint64_t current_turn_id_{};
+  uint64_t next_turn_id_{1};
+  bool has_current_turn_{};
+  bool turn_id_exhausted_{};
+  GenerationFinishReason finish_reason_{GenerationFinishReason::None};
+  // Drafts proposed for the next step, the ones the step in flight staged onto the sequence, and
+  // the leading part of those the target model accepted.
+  std::vector<int32_t> draft_tokens_;
+  size_t staged_draft_count_{};
+  size_t accepted_draft_count_{};
+  bool draft_verification_completed_generation_{};
   std::shared_ptr<GeneratorParams> params_;
   std::mt19937 rng_;
   std::mt19937 transaction_rng_;
@@ -337,14 +378,16 @@ struct Request : std::enable_shared_from_this<Request>,
   std::unique_ptr<ConstrainedLogitsProcessor> guidance_transaction_checkpoint_;
   std::unique_ptr<BatchedSamplerState> batched_sampler_state_;
   std::weak_ptr<Engine> engine_;
-  std::atomic<bool> externally_abandoned_{false};
+  const Engine* engine_identity_{};
 
-  void ApplyLogitsProcessors(DeviceSpan<float> logits);
+  void ApplyLogitsProcessors(DeviceSpan<float> logits, bool guidance_applied);
+  void ResetGuidanceForNewTurn();
   void SelectNextToken();
+  void StageVisibleTokens(RequestStepResult& result,
+                          size_t committed_count,
+                          std::optional<int32_t> sampled_token) const;
   RequestStepResult StageGeneration(int64_t sequence_length_before);
   void CommitGuidanceToken(const RequestStepResult& result);
-
-  void* opaque_data_{nullptr};  // Opaque data for user-defined purposes, can be set and retrieved by the application
 };
 
 }  // namespace Generators
