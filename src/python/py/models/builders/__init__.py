@@ -3,7 +3,7 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # -------------------------------------------------------------------------
-# Copyright (C) [2026] Advanced Micro Devices, Inc. All rights reserved.
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 # Portions of this file consist of AI generated content.
 # -------------------------------------------------------------------------
 from .base import Model
@@ -12,7 +12,9 @@ from .ernie import ErnieModel
 from .gemma import Gemma2Model, Gemma3Model, GemmaModel
 from .gptoss import GPTOSSModel
 from .granite import GraniteModel
+from .hunyuan import HunyuanDenseV1Model
 from .internlm import InternLM2Model
+from .lfm2 import LFM2Model
 from .llama import LlamaModel
 from .mistral import Mistral3TextModel, MistralModel
 from .nemotron import NemotronModel
@@ -27,7 +29,7 @@ from .phi import (
     Phi4MMModel,
     PhiModel,
 )
-from .qwen import Qwen3Model, Qwen3VLTextModel, Qwen25VLTextModel, Qwen35TextModel, QwenModel
+from .qwen import Qwen3Model, Qwen25VLTextModel, Qwen3VLTextModel, Qwen35TextModel, QwenModel, VideoChatFlashQwenModel
 from .smollm import SmolLM3Model
 from .whisper import WhisperModel
 
@@ -39,7 +41,9 @@ __all__ = [
     "Gemma3Model",
     "GemmaModel",
     "GraniteModel",
+    "HunyuanDenseV1Model",
     "InternLM2Model",
+    "LFM2Model",
     "LlamaModel",
     "Mistral3TextModel",
     "MistralModel",
@@ -60,5 +64,6 @@ __all__ = [
     "Qwen35TextModel",
     "QwenModel",
     "SmolLM3Model",
+    "VideoChatFlashQwenModel",
     "WhisperModel",
 ]

@@ -3,7 +3,8 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
-# Copyright (C)  [2026]  Advanced Micro Devices, Inc. All rights reserved. Portions of this file consist of AI generated content.
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Portions of this file consist of AI generated content.
 # --------------------------------------------------------------------------
 """
 Run the model builder to create the desired ONNX model.
@@ -24,7 +25,9 @@ from builders import (
     GemmaModel,
     GPTOSSModel,
     GraniteModel,
+    HunyuanDenseV1Model,
     InternLM2Model,
+    LFM2Model,
     LlamaModel,
     Mistral3TextModel,
     MistralModel,
@@ -45,6 +48,7 @@ from builders import (
     Qwen35TextModel,
     QwenModel,
     SmolLM3Model,
+    VideoChatFlashQwenModel,
     WhisperModel,
 )
 from transformers import (
@@ -241,8 +245,12 @@ def create_model(
         onnx_model = GPTOSSModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "GraniteForCausalLM":
         onnx_model = GraniteModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
+    elif config.architectures[0] == "HunYuanDenseV1ForCausalLM":
+        onnx_model = HunyuanDenseV1Model(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "InternLM2ForCausalLM":
         onnx_model = InternLM2Model(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
+    elif config.architectures[0] == "Lfm2ForCausalLM":
+        onnx_model = LFM2Model(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "LlamaForCausalLM":
         onnx_model = LlamaModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "MistralForCausalLM":
@@ -286,6 +294,10 @@ def create_model(
         onnx_model = Phi4MMModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "Qwen2ForCausalLM":
         onnx_model = QwenModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
+    elif config.architectures[0] == "VideoChatFlashQwenForCausalLM":
+        print("WARNING: This is only generating the text component of the model. Setting `--extra_options exclude_embeds=true` by default.")
+        extra_options["exclude_embeds"] = True
+        onnx_model = VideoChatFlashQwenModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "Qwen2_5_VLForConditionalGeneration":
         text_config = config.text_config
         for key in text_config:

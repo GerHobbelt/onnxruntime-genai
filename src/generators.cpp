@@ -4,8 +4,11 @@
 // Modifications Copyright(C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 
 #include "generators.h"
+#include <cstring>
+#include <cstdlib>
 #include "models/streaming_processor.h"
 #include "models/nemotron_speech.h"
+#include "models/parakeet.h"
 #include "sequences.h"
 #include "models/env_utils.h"
 #include "models/model.h"
@@ -87,11 +90,28 @@ GetOrtGlobals() {
   return globals;
 }
 
-// Used by Shutdown() to display the counts and types of any leaked objects
+// Used by Shutdown() to display the counts and types of any leaked objects.
+// Leak reporting is gated to debug builds or when logging is enabled, since
+// consuming applications often cannot guarantee model teardown before process
+// exit, and there is little they can do in response at that point.
+static bool ShouldReportLeaks() {
+#if !defined(NDEBUG)
+  return true;
+#else
+  return g_log.enabled;
+#endif
+}
+
 template <typename... Types>
 bool LeakTypeList<Types...>::Dump() {
-  ((LeakChecked<Types>::Count() != 0 ? std::cerr << "OGA Error: " << LeakChecked<Types>::Count() << " instances of " << typeid(Types).name() << " were leaked." << std::endl : std::cerr), ...);
-  return ((LeakChecked<Types>::Count() != 0) || ...);
+  const bool report = ShouldReportLeaks();
+  bool any_leaked = false;
+  ((LeakChecked<Types>::Count() != 0
+        ? (any_leaked = true,
+           report ? (std::cerr << "OGA Error: " << LeakChecked<Types>::Count() << " instances of " << typeid(Types).name() << " were leaked." << std::endl, 0) : 0)
+        : 0),
+   ...);
+  return any_leaked && report;
 }
 
 void Shutdown() {
@@ -348,11 +368,11 @@ std::unique_ptr<Search> CreateSearch(const GeneratorParams& params) {
 }
 
 Generator::Generator(const Model& model, const GeneratorParams& params) : model_{model.shared_from_this()} {
-  // RNNT models don't use the traditional search/logits pipeline,
+  // RNNT and TDT models don't use the traditional search/logits pipeline,
   // so skip the standard validations and just create the state.
-  if (ModelType::IsRNNT(model.config_->model.type)) {
+  if (ModelType::IsTransducer(model.config_->model.type)) {
     state_ = model.CreateState({}, params);
-    is_nemotron_speech_model_ = dynamic_cast<NemotronSpeechState*>(state_.get()) != nullptr;
+    transducer_state_ = dynamic_cast<TransducerState*>(state_.get());
     return;
   }
 
@@ -548,22 +568,36 @@ void Generator::ComputeLogits(DeviceSpan<int32_t> next_tokens) {
 }
 
 void Generator::SetRuntimeOption(const char* key, const char* value) {
+  // Nemotron speech models support per-generator "lang_id" override so that
+  // a single loaded model can serve generators in different languages.
+  if (ModelType::IsRNNT(model_->config_->model.type) && key != nullptr && std::strcmp(key, "lang_id") == 0) {
+    if (value == nullptr) {
+      throw std::runtime_error("SetRuntimeOption(\"lang_id\"): value must not be null.");
+    }
+    size_t pos = 0;
+    int lang_id = std::stoi(value, &pos);
+    if (pos != std::strlen(value)) {
+      throw std::runtime_error(std::string("SetRuntimeOption(\"lang_id\"): invalid integer value \"") + value + "\".");
+    }
+    static_cast<NemotronSpeechState*>(state_.get())->SetLangId(lang_id);
+    return;
+  }
   state_->SetRunOption(key, value);
 }
 
 size_t Generator::TokenCount() const {
-  if (is_nemotron_speech_model_)
-    return static_cast<NemotronSpeechState*>(state_.get())->TokenCount();
+  if (transducer_state_)
+    return transducer_state_->TokenCount();
   return static_cast<size_t>(search_->GetSequenceLength());
 }
 
 bool Generator::IsDone() {
   ThrowErrorIfSessionTerminated(state_->session_terminated_);
 
-  if (is_nemotron_speech_model_) {
+  if (transducer_state_) {
     // Pending mel input means we haven't started processing this chunk yet
     if (!extra_inputs_.empty()) return false;
-    return static_cast<NemotronSpeechState*>(state_.get())->IsChunkDone();
+    return transducer_state_->IsChunkDone();
   }
 
   if (computed_logits_) {
@@ -596,11 +630,12 @@ void Generator::GenerateNextToken() {
 
   ThrowErrorIfSessionTerminated(state_->session_terminated_);
 
-  // RNNT models: yield one token per call from the decoder state machine
-  if (is_nemotron_speech_model_) {
+  // Transducer models (RNNT, TDT): yield one token per call by stepping
+  // the encoder/decoder/joiner loop directly.
+  if (transducer_state_) {
     state_->SetExtraInputs(extra_inputs_);
     extra_inputs_.clear();
-    static_cast<NemotronSpeechState*>(state_.get())->StepToken();
+    transducer_state_->StepToken();
     return;
   }
 
@@ -660,7 +695,7 @@ void Generator::GenerateNextToken() {
 }
 
 void Generator::RewindToLength(size_t new_length) {
-  if (model_->config_->model.type == "whisper" || model_->config_->model.type == "phi3v" || model_->config_->model.type == "decoder-pipeline")
+  if (model_->config_->model.type == "whisper" || model_->config_->model.type == "phi3v" || model_->config_->model.type == "decoder-pipeline" || model_->config_->model.type == "lfm2")
     throw std::runtime_error("RewindTo is currently not supported for " + model_->config_->model.type + ".");
   if (new_length > search_->GetSequenceLength())
     throw std::runtime_error("Cannot rewind to a length greater than the current sequence length");

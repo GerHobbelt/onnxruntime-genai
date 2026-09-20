@@ -1,7 +1,8 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 //
-// Modifications Copyright(C) 2024-2026 Advanced Micro Devices, Inc. All rights reserved.
+// Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// Portions of this file consist of AI generated content.
 #include <algorithm>
 #include <climits>
 #include <random>
@@ -16,12 +17,16 @@
 #include "gpt.h"
 #include "decoder_only.h"
 #include "whisper.h"
+#include "parakeet.h"
+#include "parakeet_processor.h"
 #include "nemotron_speech.h"
 #include "multi_modal.h"
+#include "lfm2.h"
 #include "marian.h"
 #include "decoder_only_pipeline.h"
 #include "qwen_vl_model.h"
 #include "qwen2_5_vl_image_processor.h"
+#include "videochat_flash_processor.h"
 #include "mistral3_image_processor.h"
 #include "../dml/interface.h"
 #include "../openvino/interface.h"
@@ -821,12 +826,16 @@ std::shared_ptr<Model> CreateModel(OrtEnv& ort_env, std::unique_ptr<Config> conf
   // Check if it's a pipeline model by checking if decoder.pipeline is configured
   if ((config->model.type == "fara" || config->model.type == "qwen2_5_vl" || config->model.type == "qwen3_vl") && !config->model.decoder.pipeline.empty())
     return std::make_shared<Qwen2_5_VL_PipelineModel>(std::move(config), ort_env);
+  if (config->model.type == "lfm2")
+    return std::make_shared<LFM2_Model>(std::move(config), ort_env);
   if (config->model.type == "gpt2")
     return std::make_shared<Gpt_Model>(std::move(config), ort_env);
   if (ModelType::IsLLM(config->model.type))
     return std::make_shared<DecoderOnly_Model>(std::move(config), ort_env);
   if (ModelType::IsRNNT(config->model.type))
     return std::make_shared<NemotronSpeechModel>(std::move(config), ort_env);
+  if (ModelType::IsTDT(config->model.type))
+    return std::make_shared<ParakeetTdtModel>(std::move(config), ort_env);
   if (ModelType::IsALM(config->model.type))
     return std::make_shared<WhisperModel>(std::move(config), ort_env);
   if (ModelType::IsVLM(config->model.type))
@@ -933,6 +942,7 @@ MultiModalProcessor::MultiModalProcessor(Config& config, const SessionInfo& sess
       processor_factory_{
           {"phi3v", Processor::Create<PhiImageProcessor>},
           {"whisper", Processor::Create<WhisperProcessor>},
+          {"parakeet_tdt", Processor::Create<ParakeetTdtProcessor>},
           {"phi4mm", Processor::Create<PhiMultiModalProcessor>},
           {"gemma3", Processor::Create<GemmaImageProcessor>},
           {"gemma4", Processor::Create<Gemma4MultiModalProcessor>},
@@ -940,7 +950,8 @@ MultiModalProcessor::MultiModalProcessor(Config& config, const SessionInfo& sess
           {"fara", Processor::Create<QwenImageProcessor>},
           {"qwen2_5_vl", Processor::Create<QwenImageProcessor>},
           {"qwen3_vl", Processor::Create<QwenImageProcessor>},
-          {"qwen3_5", Processor::Create<QwenImageProcessor>}} {
+          {"qwen3_5", Processor::Create<QwenImageProcessor>},
+          {"videochat_flash_qwen", Processor::Create<VideoChatFlashProcessor>}} {
   auto processor = processor_factory_.find(config.model.type);
   if (processor != processor_factory_.end()) {
     processor_ = processor->second(config, session_info);

@@ -3,13 +3,17 @@
 # Licensed under the MIT License.  See License.txt in the project root for
 # license information.
 # --------------------------------------------------------------------------
+# Modifications Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Portions of this file consist of AI generated content.
 
+import os
 
 import numpy as np
 import onnx_ir as ir
 import torch
 from transformers import (
     AutoConfig,
+    Qwen2ForCausalLM,
     Qwen2_5_VLForConditionalGeneration,
     Qwen3VLForConditionalGeneration,
 )
@@ -439,17 +443,17 @@ class Qwen25VLTextModel(Model):
         shape_node = f"{basename}/Shape"
         self.make_shape(shape_node, q_or_k_path, [3])
 
-        # Extract B and S
+        # Extract B and S (scalar Gather indices → scalar outputs)
         batch_size_node = f"{basename}/BatchSize/Gather"
         batch_size_out = f"{batch_size_node}/output_0"
         self.make_gather(
-            batch_size_node, [f"{shape_node}/output_0", "/model/constants/INT64/[0]"], ir.DataType.INT64, [], 0
+            batch_size_node, [f"{shape_node}/output_0", "/model/constants/INT64/0"], ir.DataType.INT64, [], 0
         )
 
         seq_len_node = f"{basename}/SeqLen/Gather"
         seq_len_out = f"{seq_len_node}/output_0"
         self.make_gather(
-            seq_len_node, [f"{shape_node}/output_0", "/model/constants/INT64/[1]"], ir.DataType.INT64, [], 0
+            seq_len_node, [f"{shape_node}/output_0", "/model/constants/INT64/1"], ir.DataType.INT64, [], 0
         )
 
         # Calculate Total Tokens = B * S
@@ -899,7 +903,11 @@ class Qwen3VLTextModel(Qwen25VLTextModel):
         return flat_cos, flat_sin
 
     def load_weights(self, input_path):
-        # Load the Hugging Face model
+        # For quantized models (e.g., Quark, AWQ, GPTQ) or GGUF, use base class logic
+        # which loads weights directly via QuantModel
+        if self.quant_type is not None or input_path.endswith(".gguf"):
+            return super().load_weights(input_path)
+
         print("Loading Qwen3VLForConditionalGeneration model...")
         return Qwen3VLForConditionalGeneration.from_pretrained(
             self.model_name_or_path,
@@ -909,6 +917,35 @@ class Qwen3VLTextModel(Qwen25VLTextModel):
         )
 
 
+class VideoChatFlashQwenModel(QwenModel):
+    """
+    Builder for OpenGVLab/VideoChat-Flash models (VideoChatFlashQwenForCausalLM).
+
+    The language model backbone is standard Qwen2.5-7B with flat config and
+    standard weight keys (model.layers.*, lm_head.*). The model uses standard
+    2D RoPE (rope_scaling=None) and GQA (28 query heads, 4 KV heads).
+
+    This builder exports only the text decoder component. It sets exclude_embeds=True
+    so the decoder receives inputs_embeds from the embedding merger model, which
+    fuses the InternVideo2 visual tokens with text embeddings.
+    """
+
+    def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
+        super().__init__(config, io_dtype, onnx_dtype, ep, cache_dir, extra_options)
+
+        # Override model_type for the C++ runtime registration in model.cpp
+        # and genai_config.json. Same pattern as Qwen3VLTextModel.
+        # Base class transforms this to "videochat_flash_qwen" via:
+        #   model_type[:model_type.find("For")].lower()
+        self.model_type = "VideoChat_Flash_QwenForCausalLM"
+
+    def load_weights(self, input_path):
+        extra_kwargs = {} if os.path.isdir(self.model_name_or_path) else {"cache_dir": self.cache_dir}
+        return Qwen2ForCausalLM.from_pretrained(
+            self.model_name_or_path,
+            token=self.hf_token,
+            **extra_kwargs,
+        )
 class Qwen35TextModel(Model):
     """Qwen3.5 hybrid model builder.
 
@@ -926,6 +963,8 @@ class Qwen35TextModel(Model):
 
     def __init__(self, config, io_dtype, onnx_dtype, ep, cache_dir, extra_options):
         # Qwen3.5 is a VL model. The decoder takes inputs_embeds.
+        # When exclude_embeds is explicitly set to False, build as a standalone LLM.
+        self.is_text_only = extra_options.get("exclude_embeds", None) is False
         if "exclude_embeds" not in extra_options:
             extra_options["exclude_embeds"] = True
             print("Setting exclude_embeds=True for Qwen3.5 VL decoder.")
@@ -969,18 +1008,14 @@ class Qwen35TextModel(Model):
         # SkipSimplifiedLayerNormalization can be used directly.
         self.layernorm_attrs["add_offset"] = 1
 
-        # HF Qwen3_5RMSNorm always computes in float32 regardless of model
-        # dtype.  Force the builder to cast inputs to fp32 before LayerNorm
-        # and cast back after, matching HF behaviour and preventing precision
-        # loss that compounds across 36+ layers in fp16/bf16 builds.
-        self.layernorm_attrs["cast"]["use_fp32"] = True
-        self.layernorm_attrs["cast"]["root_input"] = True
-        self.layernorm_attrs["cast"]["skip_input"] = True
-        self.layernorm_attrs["cast"]["output_0"] = True
-        self.layernorm_attrs["cast"]["output_3"] = True
-
-        # 3D position_ids for mRoPE: [3, batch_size, sequence_length]
-        self.input_shapes["position_ids"] = [3, "batch_size", "sequence_length"]
+        # Position IDs input.
+        # In text-only mode the runtime provides standard 2D [B, S] position_ids.
+        # We expand them to 3D [3, B, S] inside the graph so mRoPE works unchanged.
+        # In VL mode the pipeline provides 3D position_ids directly.
+        if self.is_text_only:
+            self.input_shapes["position_ids"] = ["batch_size", "sequence_length"]
+        else:
+            self.input_shapes["position_ids"] = [3, "batch_size", "sequence_length"]
         self.input_names["position_ids"] = "position_ids"
 
         # mRoPE config
@@ -1086,6 +1121,34 @@ class Qwen35TextModel(Model):
         self.input_names["past_key_values.value"] = filtered_value_inputs
         self.output_names["present.key"] = filtered_key_outputs
         self.output_names["present.value"] = filtered_value_outputs
+
+    def make_position_ids_reformatting(self):
+        if self.is_text_only:
+            # The graph input is 2D position_ids [B, S].
+            # Expand to 3D [3, B, S] for mRoPE by stacking 3 copies.
+            pos_2d = "position_ids"
+            unsq_name = "/model/position_ids_expand/Unsqueeze"
+            unsq_output = f"{unsq_name}/output_0"
+            self.make_unsqueeze(
+                unsq_name,
+                [pos_2d, "/model/constants/INT64/[0]"],
+                ir.DataType.INT64,
+                [1, "batch_size", "sequence_length"],
+            )
+            tile_name = "/model/position_ids_expand/Tile"
+            tile_output = f"{tile_name}/output_0"
+            self.make_tile(
+                tile_name,
+                [unsq_output, "/model/constants/INT64/[3, 1, 1]"],
+                ir.DataType.INT64,
+                [3, "batch_size", "sequence_length"],
+            )
+            return tile_output
+        return self.input_names["position_ids"]
+
+    def make_preprocessing_nodes(self):
+        super().make_preprocessing_nodes()
+        self.position_ids_reformatted = self.make_position_ids_reformatting()
 
     def make_attention(self, layer_id, attention, root_input, **kwargs):
         """Dispatch to full attention or GatedDeltaNet based on layer type."""
@@ -1330,10 +1393,10 @@ class Qwen35TextModel(Model):
     def _make_mrope_cos_sin(self, basename):
         """Build interleaved mRoPE cos/sin from pre-computed cache + position_ids.
 
-        Input: position_ids [3, B, S]
+        Input: position_ids [3, B, S] (from self.position_ids_reformatted)
         Output: cos [B, S, rdim_half], sin [B, S, rdim_half]
         """
-        pos_ids = self.input_names["position_ids"]
+        pos_ids = self.position_ids_reformatted
         cos_cache = "model.rotary_emb.cos_cache"
         sin_cache = "model.rotary_emb.sin_cache"
         h_mask = "model.rotary_emb.h_mask"
@@ -1382,6 +1445,84 @@ class Qwen35TextModel(Model):
 
         return interleave("cos", cos_cache), interleave("sin", sin_cache)
 
+    def _make_synthetic_position_ids(self):
+        """Build synthetic position_ids [B, S] with values 0 .. B*S-1.
+
+        Derives B and S from the ``position_ids`` model input ``[3, B, S]``
+        instead of using Shape on intermediate Q/K tensors.  This avoids a
+        data-dependency on Q/K computation.
+
+        B*S is obtained by reshaping position_ids to ``[3, -1]`` and reading
+        the inferred dimension from the shape.  This lets the runtime compute
+        the product implicitly (Reshape is metadata-only) and avoids an
+        explicit INT64 Mul that would fall back to CPU on WebGPU.
+
+        Uses a fixed basename so ``make_node`` dedup ensures nodes are
+        created once and reused across all layers and Q/K calls.
+        """
+        basename = "/model/attn/synthetic_pos_ids"
+        pos_ids_input = self.position_ids_reformatted
+
+        # Shape(position_ids) → [3, B, S]
+        shape_name = f"{basename}/Shape"
+        self.make_shape(shape_name, root_input=pos_ids_input, shape=[3])
+
+        # Slice shape[1:3] → [B, S] (used as reshape target at the end)
+        bs_shape_name = f"{basename}/bs_shape/Slice"
+        self.make_slice(
+            bs_shape_name,
+            inputs=[
+                f"{shape_name}/output_0",
+                "/model/constants/INT64/[1]",
+                "/model/constants/INT64/[3]",
+                "/model/constants/INT64/[0]",
+            ],
+            dtype=ir.DataType.INT64,
+            shape=[2],
+        )
+
+        # Reshape position_ids [3, B, S] → [3, -1] to get B*S implicitly
+        flat_name = f"{basename}/flat/Reshape"
+        self.make_reshape(
+            flat_name,
+            inputs=[pos_ids_input, "/model/constants/INT64/[3, -1]"],
+            dtype=ir.DataType.INT64,
+            shape=[3, "batch_seq"],
+        )
+
+        # Shape([3, B*S]) → [3, B*S], Gather scalar index 1 → scalar B*S
+        shape2_name = f"{basename}/Shape2"
+        self.make_shape(shape2_name, root_input=f"{flat_name}/output_0", shape=[2])
+
+        total_name = f"{basename}/total/Gather"
+        self.make_gather(
+            total_name,
+            inputs=[f"{shape2_name}/output_0", "/model/constants/INT64/1"],
+            dtype=ir.DataType.INT64,
+            shape=[],
+            axis=0,
+        )
+
+        # Range(0, B*S, 1)
+        range_name = f"{basename}/range/Range"
+        self.make_range(
+            range_name,
+            inputs=["/model/constants/INT64/0", f"{total_name}/output_0", "/model/constants/INT64/1"],
+            dtype=ir.DataType.INT64,
+            shape=["batch_seq"],
+        )
+
+        # Reshape to [B, S]
+        pos_ids_name = f"{basename}/Reshape"
+        self.make_reshape(
+            pos_ids_name,
+            inputs=[f"{range_name}/output_0", f"{bs_shape_name}/output_0"],
+            dtype=ir.DataType.INT64,
+            shape=["batch_size", "sequence_length"],
+        )
+
+        return f"{pos_ids_name}/output_0"
+
     def _apply_mrope_rotation(self, layer_id, qk_path, qk_shape, dyn_cos, dyn_sin, num_heads, basename):
         """Apply mRoPE via com.microsoft.RotaryEmbedding (4-input variant).
 
@@ -1429,45 +1570,10 @@ class Qwen35TextModel(Model):
             rope_sin = f"{sin_cast_name}/output_0"
 
         # --- Build synthetic position_ids [B, S] = Range(0, B*S).reshape(B, S) ---
-        # Shape(Q/K input) → [B, S, N*H], Gather dim 0 and 1 → B, S
-        shape_name = f"{basename}/qk_shape/Shape"
-        self.make_shape(shape_name, qk_path, [3])
-
-        batch_name = f"{basename}/batch/Gather"
-        self.make_gather(batch_name, [f"{shape_name}/output_0", "/model/constants/INT64/[0]"], ir.DataType.INT64, [1], axis=0)
-
-        seq_name = f"{basename}/seq/Gather"
-        self.make_gather(seq_name, [f"{shape_name}/output_0", "/model/constants/INT64/[1]"], ir.DataType.INT64, [1], axis=0)
-
-        total_name = f"{basename}/total/Mul"
-        self.make_mul(total_name, [f"{batch_name}/output_0", f"{seq_name}/output_0"], ir.DataType.INT64, [1])
-
-        range_name = f"{basename}/range/Range"
-        self.make_range(
-            range_name,
-            ["/model/constants/INT64/[0]", f"{total_name}/output_0", "/model/constants/INT64/[1]"],
-            ir.DataType.INT64,
-            ["batch_seq"],
-        )
-
-        # Reshape to [B, S]
-        bs_shape_name = f"{basename}/bs_shape/Concat"
-        self.make_concat(
-            bs_shape_name,
-            [f"{batch_name}/output_0", f"{seq_name}/output_0"],
-            ir.DataType.INT64,
-            [2],
-            axis=0,
-        )
-
-        pos_ids_name = f"{basename}/pos_ids/Reshape"
-        self.make_reshape(
-            pos_ids_name,
-            [f"{range_name}/output_0", f"{bs_shape_name}/output_0"],
-            ir.DataType.INT64,
-            ["batch_size", "sequence_length"],
-        )
-        pos_ids = f"{pos_ids_name}/output_0"
+        # Derive B and S from the position_ids input [3, B, S] instead of
+        # using Shape on intermediate Q/K tensors.  Shared across all layers
+        # and Q/K calls via make_node dedup.
+        pos_ids = self._make_synthetic_position_ids()
 
         # --- Reshape Q/K to [B, N, S, H] for com.microsoft.RotaryEmbedding ---
         head_size = qk_shape[-1] // num_heads if isinstance(qk_shape[-1], int) else self.head_size
@@ -1821,38 +1927,20 @@ class Qwen35TextModel(Model):
         return unflat_out
 
     def _make_l2_normalize(self, basename, input_name, last_dim, leading_dims=None):
-        """L2-normalize along last dimension: x * rsqrt(sum(x^2) + eps)
+        """L2-normalize along last dimension via ORT's LpNormalization(p=2).
 
-        Matches the FLA library's l2norm used by the PyTorch reference:
-            inv_norm = rsqrt((x * x).sum(dim=-1, keepdim=True) + eps)
-            return x * inv_norm
+        Replaces the 5-node Square+ReduceSum+Add(eps)+Rsqrt+Mul subgraph with
+        a single LpNormalization op (natively supported by the WebGPU EP and
+        others). The +eps term is dropped; q/k come from RMSNorm+Proj so
+        magnitudes far exceed 1e-6, keeping any divergence within fp16 noise.
         """
         if leading_dims is None:
             leading_dims = ["batch_size", "sequence_length"]
         full_shape = [*leading_dims, last_dim]
-        reduced_shape = [*leading_dims, 1]
 
-        # sum(x^2, dim=-1, keepdim=True)
-        sq_name = f"{basename}/Square/Mul"
-        self.make_mul(sq_name, [input_name, input_name], self.io_dtype, full_shape)
-
-        sum_name = f"{basename}/SumSq/ReduceSum"
-        self.make_reduce_sum(sum_name, [f"{sq_name}/output_0", "/model/constants/INT64/[-1]"],
-                             self.io_dtype, reduced_shape, keepdims=True)
-
-        # sum(x^2) + eps
-        eps_name = self._get_shared_l2_eps()
-        add_eps_name = f"{basename}/AddEps/Add"
-        self.make_add(add_eps_name, [f"{sum_name}/output_0", eps_name], self.io_dtype, reduced_shape)
-
-        # x * rsqrt(sum(x^2) + eps)
-        rsqrt_name = f"{basename}/Rsqrt"
-        self.make_rsqrt(rsqrt_name, [f"{add_eps_name}/output_0"], self.io_dtype, reduced_shape)
-
-        norm_name = f"{basename}/Normalize/Mul"
-        self.make_mul(norm_name, [input_name, f"{rsqrt_name}/output_0"], self.io_dtype, full_shape)
-
-        return f"{norm_name}/output_0"
+        node_name = f"{basename}/LpNormalization"
+        self.make_lp_normalization(node_name, input_name, self.io_dtype, full_shape, axis=-1, p=2)
+        return f"{node_name}/output_0"
 
     def _make_gated_rms_norm(self, basename, input_name, gate_name, norm_module, layer_id):
         """Gated RMSNorm: RMSNorm(x) * SiLU(z).
@@ -1964,7 +2052,7 @@ class Qwen35TextModel(Model):
             "model_type": self.model_type,
         }
         self.num_layers = len(self.layer_types)
-        self.model_type = "Qwen3_5ForConditionalGeneration"
+        self.model_type = "Qwen3_5_textForCausalLM" if self.is_text_only else "Qwen3_5ForConditionalGeneration"
         self.input_names["past_key_values.key"] = "past_key_values.%d.key"
         self.input_names["past_key_values.value"] = "past_key_values.%d.value"
         self.output_names["present.key"] = "present.%d.key"
