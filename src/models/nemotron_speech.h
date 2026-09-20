@@ -9,7 +9,7 @@
 
 namespace Generators {
 
-struct NemotronCacheConfig {
+struct NemotronConfig {
   // Encoder dimensions (from encoder.hidden_size / num_hidden_layers)
   int num_encoder_layers{};
   int hidden_dim{};
@@ -23,6 +23,7 @@ struct NemotronCacheConfig {
   // Vocabulary
   int vocab_size{};
   int blank_id{};
+  float blank_penalty{};
 
   // Streaming chunk config
   int chunk_frames{};
@@ -56,11 +57,9 @@ struct NemotronCacheConfig {
 
   // Decoder (prediction network) I/O names
   std::string dec_in_targets;
-  std::string dec_in_target_length;
   std::string dec_in_lstm_hidden;
   std::string dec_in_lstm_cell;
   std::string dec_out_outputs;
-  std::string dec_out_prednet_lengths;
   std::string dec_out_lstm_hidden;
   std::string dec_out_lstm_cell;
 
@@ -78,8 +77,8 @@ struct NemotronEncoderCache {
   std::unique_ptr<OrtValue> cache_last_time;
   std::unique_ptr<OrtValue> cache_last_channel_len;
 
-  void Initialize(const NemotronCacheConfig& cfg, const SessionInfo& session_info, OrtAllocator& allocator, DeviceInterface& device);
-  void Reset(const NemotronCacheConfig& cfg, const SessionInfo& session_info, OrtAllocator& allocator, DeviceInterface& device);
+  void Initialize(const NemotronConfig& cfg, const SessionInfo& session_info, OrtAllocator& allocator, DeviceInterface& device);
+  void Reset(const NemotronConfig& cfg, const SessionInfo& session_info, OrtAllocator& allocator, DeviceInterface& device);
 };
 
 /// Holds the RNNT decoder LSTM hidden states between decoding steps.
@@ -88,8 +87,8 @@ struct NemotronDecoderState {
   std::unique_ptr<OrtValue> lstm_cell_state;
   int last_token{0};  // Last emitted non-blank token (for autoregressive feedback)
 
-  void Initialize(const NemotronCacheConfig& cfg, const SessionInfo& session_info, OrtAllocator& allocator, DeviceInterface& device);
-  void Reset(const NemotronCacheConfig& cfg, const SessionInfo& session_info, OrtAllocator& allocator, DeviceInterface& device);
+  void Initialize(const NemotronConfig& cfg, const SessionInfo& session_info, OrtAllocator& allocator, DeviceInterface& device);
+  void Reset(const NemotronConfig& cfg, const SessionInfo& session_info, OrtAllocator& allocator, DeviceInterface& device);
 };
 
 struct NemotronSpeechModel : Model {
@@ -107,7 +106,7 @@ struct NemotronSpeechModel : Model {
   std::unique_ptr<OrtSessionOptions> decoder_session_options_;
   std::unique_ptr<OrtSessionOptions> joiner_session_options_;
 
-  NemotronCacheConfig cache_config_;
+  NemotronConfig nemotron_config_;
 };
 
 /// Sub-state for the streaming encoder.
@@ -129,6 +128,9 @@ struct NemotronEncoderSubState : State {
   const NemotronSpeechModel& model_;
   NemotronEncoderCache cache_;
   std::unique_ptr<OrtValue> signal_length_;
+
+  // Whether the encoder model has a "length" input
+  bool has_length_input_{};
 
   // Indices into inputs_/outputs_ vectors
   size_t mel_input_idx_{};
@@ -154,10 +156,8 @@ struct NemotronPredictionSubState : State {
   const NemotronSpeechModel& model_;
   NemotronDecoderState lstm_state_;
   std::unique_ptr<OrtValue> targets_;
-  std::unique_ptr<OrtValue> target_length_;
 
   size_t targets_input_idx_{};
-  size_t target_length_input_idx_{};
   size_t lstm_hidden_input_idx_{};
   size_t lstm_cell_input_idx_{};
 };
@@ -202,7 +202,7 @@ struct NemotronSpeechState : State {
 
  private:
   const NemotronSpeechModel& nemotron_model_;
-  NemotronCacheConfig cache_config_;
+  NemotronConfig nemotron_config_;
 
   std::unique_ptr<NemotronEncoderSubState> encoder_state_;
   std::unique_ptr<NemotronPredictionSubState> prediction_state_;

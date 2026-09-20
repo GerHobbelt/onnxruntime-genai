@@ -40,6 +40,7 @@ struct Config {
     static constexpr std::string_view ImageSizesName = "image_sizes";
     static constexpr std::string_view ImageGridThwName = "image_grid_thw";
     static constexpr std::string_view ImageAttentionMaskName = "image_attention_mask";
+    static constexpr std::string_view PixelPositionIdsName = "pixel_position_ids";
     static constexpr std::string_view ImageFeaturesName = "image_features";
     static constexpr std::string_view NumImageTokens = "num_image_tokens";
 
@@ -127,8 +128,10 @@ struct Config {
     int sep_token_id{};             // The id of the separation token.
     int decoder_start_token_id{};   // If an encoder-decoder model starts decoding with a different token than bos, the id of that token.
 
-    // Qwen2.5-VL specific token IDs
+    // Multimodal token IDs (used by Qwen-VL, Gemma4, and other VLM/MMM models)
     int image_token_id{};
+    int audio_token_id{};
+    int boa_token_id{};  // Beginning-of-audio token ID
     int video_token_id{};
     int vision_start_token_id{};
 
@@ -208,10 +211,17 @@ struct Config {
       std::optional<SessionOptions> session_options;
       std::optional<RunOptions> run_options;
 
-      // Qwen VL specific vision config values
+      // Qwen VL specific vision config values.
+      // These are only needed for the QNN 3-stage pipeline (patch_embed → vision_attn → patch_merger),
+      // where the C++ runtime computes window attention indices between stages.
+      // For standard single-ONNX CUDA/CPU models, windowing is baked into the ONNX graph
+      // and these values are unused.
       int spatial_merge_size{2};
       float tokens_per_second{2.0f};
-      int patch_size{14};  // Qwen2.5-VL uses 14, Qwen3-VL/3.5 uses 16
+      int patch_size{14};  // Qwen2.5-VL uses 14, Qwen3-VL uses 16
+      int window_size{0};  // Used by CalculateWindowIndex() in QNN pipeline only.
+                           // 0 = auto-compute as patch_size * spatial_merge_size * 2
+                           // Qwen2.5-VL default: 56 (14*4), Qwen3-VL default: 64 (16*4)
 
       std::string config_filename{"processor_config.json"};
       std::optional<std::string> adapter_filename{};
@@ -230,6 +240,7 @@ struct Config {
 
       struct Inputs {
         std::string pixel_values{Defaults::PixelValuesName};
+        std::string pixel_position_ids{Defaults::PixelPositionIdsName};
         std::string image_sizes{Defaults::ImageSizesName};
         std::string image_grid_thw{Defaults::ImageSizesName};          // Qwen2.5-VL uses image_grid_thw, defaults to image_sizes
         std::string attention_mask{Defaults::ImageAttentionMaskName};  // image attention mask
@@ -275,6 +286,15 @@ struct Config {
       } outputs;
     } joiner;
 
+    struct VAD {
+      std::string filename;
+      float threshold{0.5f};
+      int silence_duration_ms{500};
+      int prefix_padding_ms{300};
+      std::optional<SessionOptions> session_options;
+      std::optional<RunOptions> run_options;
+    } vad;
+
     struct Decoder {
       std::string filename;
       SessionOptions session_options;
@@ -319,7 +339,6 @@ struct Config {
 
         // RNNT decoder inputs
         std::string targets;
-        std::string target_length;
         std::string lstm_hidden_state;
         std::string lstm_cell_state;
       } inputs;
@@ -334,7 +353,6 @@ struct Config {
 
         // RNNT decoder outputs
         std::string outputs;
-        std::string prednet_lengths;
         std::string lstm_hidden_state;
         std::string lstm_cell_state;
       } outputs;
@@ -381,6 +399,7 @@ struct Config {
     bool past_present_share_buffer{};  // The past/present kv tensors are shared and allocated once to max_length (cuda only)
     int random_seed{-1};               // -1 = Seed with random device, otherwise use value to seed RNG
     std::optional<size_t> chunk_size;  // Chunk size for prefill chunking during context processing. If present, chunking is enabled with the chunk size > 0.
+    float blank_penalty{};             // Penalty applied to blank token logits in CTC/RNNT decoding. Default 0 means no penalty.
   } search;
 
   struct Engine {
