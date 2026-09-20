@@ -24,6 +24,7 @@ from builders import (
     Gemma3Model,
     GemmaModel,
     GPTOSSModel,
+    GraniteMoeHybridModel,
     GraniteModel,
     HunyuanDenseV1Model,
     InternLM2Model,
@@ -52,6 +53,7 @@ from builders import (
     VideoChatFlashQwenModel,
     WhisperModel,
 )
+from builders.quant_config import KV_CACHE_QUANT_TYPES
 from transformers import AutoConfig
 
 
@@ -165,6 +167,7 @@ def check_extra_options(
         "disable_qkv_fusion",
         "fuse_qk_norm_gqa",
         "prune_lm_head",
+        "use_paged_attention",
     ]
 
     for key in bools:
@@ -175,6 +178,42 @@ def check_extra_options(
                 extra_options[key] = True
             else:
                 raise ValueError(f"{key} must be false/False/0 or true/True/1.")
+
+    if extra_options.get("use_paged_attention", False):
+        incompatible_options = [
+            key
+            for key in ("exclude_embeds", "exclude_lm_head", "prune_lm_head")
+            if extra_options.get(key, False)
+        ]
+        if incompatible_options:
+            raise ValueError(
+                "use_paged_attention cannot be combined with " + ", ".join(incompatible_options) + "."
+            )
+
+        for key in ("paged_block_size", "max_batch_size"):
+            if key not in extra_options:
+                continue
+            try:
+                value = int(extra_options[key])
+            except (TypeError, ValueError) as e:
+                raise ValueError(f"{key} must be a positive integer.") from e
+            if value <= 0:
+                raise ValueError(f"{key} must be a positive integer.")
+            extra_options[key] = value
+
+        if "paged_block_size" in extra_options and extra_options["paged_block_size"] % 256 != 0:
+            raise ValueError("paged_block_size must be a multiple of 256.")
+        if extra_options.get("max_batch_size", 1) > 256:
+            raise ValueError("max_batch_size must be at most 256.")
+
+        if "gpu_utilization_factor" in extra_options:
+            try:
+                gpu_utilization_factor = float(extra_options["gpu_utilization_factor"])
+            except (TypeError, ValueError) as e:
+                raise ValueError("gpu_utilization_factor must be greater than 0 and at most 1.") from e
+            if not 0 < gpu_utilization_factor <= 1:
+                raise ValueError("gpu_utilization_factor must be greater than 0 and at most 1.")
+            extra_options["gpu_utilization_factor"] = gpu_utilization_factor
 
     if "hf_token" in extra_options:
         extra_options["hf_token"] = parse_hf_token(extra_options["hf_token"])
@@ -202,7 +241,7 @@ def check_extra_options(
 
     # `moe_quant_type` is the single option that selects the MoE quantization scheme. It replaces the
     # older per-type flags (`use_8bits_moe``) so new schemes can be added without a new flag.
-    supported_moe_quant_types = {"int4", "int8", "mxfp4"}
+    supported_moe_quant_types = {"int4", "int8", "mxfp4", "nvfp4"}
 
     # Backward compatibility: `use_8bits_moe` is deprecated in favor of `moe_quant_type`.
     if "use_8bits_moe" in extra_options:
@@ -216,16 +255,19 @@ def check_extra_options(
             raise ValueError(
                 f"moe_quant_type must be one of {sorted(supported_moe_quant_types)}, got '{moe_quant_type}'."
             )
-        if moe_quant_type == "mxfp4":
+        if moe_quant_type in ("mxfp4", "nvfp4"):
+            # MXFP4 and NVFP4 share the CUDA QMoE FP4 op path and both require the int4 build
+            # precision (that is what exports the quantized QMoE op); the FP4 scheme only sets the
+            # MoE expert weights to the FP4 encoding.
             if execution_provider != "cuda":
                 raise ValueError(
-                    f"moe_quant_type=mxfp4 is only supported on the CUDA EP, got ep='{execution_provider}'."
+                    f"moe_quant_type={moe_quant_type} is only supported on the CUDA EP, got ep='{execution_provider}'."
                 )
             if not (precision == "int4" and extra_options.get("is_symmetric", True)):
                 raise ValueError(
-                    "moe_quant_type=mxfp4 requires building with precision=int4 (symmetric int4): the int4 build "
-                    "precision is what exports the quantized QMoE op, and mxfp4 only sets the MoE expert weights to "
-                    "the FP4 encoding."
+                    f"moe_quant_type={moe_quant_type} requires building with precision=int4 (symmetric int4): the "
+                    "int4 build precision is what exports the quantized QMoE op, and the FP4 scheme only sets the "
+                    "MoE expert weights to the FP4 encoding."
                 )
 
     if extra_options.get("exclude_lm_head", False) and extra_options.get("include_hidden_states", False):
@@ -241,6 +283,20 @@ def check_extra_options(
     if precision == "int8" and extra_options.get("use_qdq", False):
         # 8-bit MatMulNBits is only supported in QOperator format, not QDQ.
         raise NotImplementedError("int8 precision does not support the QDQ format (use_qdq). Use QOperator (the default).")
+
+    if "kv_cache_quant_type" in extra_options:
+        quant_type = extra_options["kv_cache_quant_type"].lower()
+        if quant_type not in KV_CACHE_QUANT_TYPES:
+            raise ValueError(
+                f"kv_cache_quant_type must be one of {sorted(KV_CACHE_QUANT_TYPES)}, "
+                f"got '{extra_options['kv_cache_quant_type']}'"
+            )
+        if quant_type != "none" and execution_provider not in {"cpu", "cuda"}:
+            raise ValueError(
+                "Quantized KV cache is only supported for the CPU and CUDA execution providers. "
+                f"Got execution_provider='{execution_provider}'."
+            )
+        extra_options["kv_cache_quant_type"] = quant_type
 
     # Get Hugging Face details and temporarily set in extra options for use in `create_model`
     hf_details = get_hf_details(model_name, input_path, cache_dir, extra_options)
@@ -415,6 +471,8 @@ def create_model(
         onnx_model = GPTOSSModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "GraniteForCausalLM":
         onnx_model = GraniteModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
+    elif config.architectures[0] == "GraniteMoeHybridForCausalLM":
+        onnx_model = GraniteMoeHybridModel(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "HunYuanDenseV1ForCausalLM":
         onnx_model = HunyuanDenseV1Model(config, io_dtype, onnx_dtype, execution_provider, cache_dir, extra_options)
     elif config.architectures[0] == "InternLM2ForCausalLM":
@@ -657,6 +715,21 @@ def get_args():
                 include_hidden_states = Include hidden states as output from your ONNX model.
                     Use this option when you want to have the hidden states as an output from your ONNX model.
                     In addition to `logits`, you will have `hidden_states` as an output to your ONNX model.
+                use_paged_attention = Build the model with PagedAttention for the continuous-batching engine. Default is false.
+                    Replaces GroupQueryAttention with the PagedAttention contrib op, packs all sequences into a single
+                    flattened token axis (`input_ids` becomes 1D), stores the KV-cache in paged
+                    [num_blocks, block_size, num_kv_heads, head_size] buffers, and removes the `attention_mask` and
+                    `position_ids` inputs in favor of the `block_table`, `cumulative_sequence_lengths`, and
+                    `past_sequence_lengths` metadata inputs. An `engine` section (block_size, gpu_utilization_factor,
+                    max_batch_size) is added to genai_config.json. Currently only supported for the CUDA execution
+                    provider with fp16 or bf16 precision. Cannot be combined with exclude_embeds, exclude_lm_head, or prune_lm_head.
+                paged_block_size = 256/512/768/...: Paged KV-cache block size used when use_paged_attention is set.
+                    Must be a positive multiple of 256 (required by the ONNX Runtime PagedAttention CUDA kernel).
+                    Default is 256. Also written to the `engine.dynamic_batching` section of genai_config.json.
+                gpu_utilization_factor = Fraction of available GPU memory used for the paged KV-cache. Default is 0.6.
+                    Must be greater than 0 and at most 1.
+                max_batch_size = Maximum number of requests in a dynamic batch. Default is 100.
+                    Must be a positive integer no greater than 256.
                 shared_embeddings = Enable weight sharing between embedding and LM head layers. Default is false.
                     Use this option to share weights and reduce model size by eliminating duplicate weights.
                     Shares quantized weights using GatherBlockQuantized and shares unquantized weights using Gather.
@@ -673,16 +746,28 @@ def get_args():
                     This affects attention mask reformatting and position IDs handling.
                 use_qdq = Use the QDQ decomposition for ops.
                     Use this option when you want to use quantize-dequantize ops. For example, you will have a quantized MatMul op instead of the MatMulNBits op.
-                moe_quant_type = int4/int8/mxfp4: Quantization scheme for MoE (QMoE) layers. Default is int4.
+                moe_quant_type = int4/int8/mxfp4/nvfp4: Quantization scheme for MoE (QMoE) layers. Default is int4.
                     int4 = 4-bit integer QMoE weights (expert_weight_bits=4, quant_type="int").
                     int8 = 8-bit integer QMoE weights (expert_weight_bits=8, quant_type="int").
                     mxfp4 = MXFP4 QMoE weights on the CUDA EP (quant_type="fp4", expert_weight_bits=4, block_size=32):
                         4-bit e2m1 weights with ue8m0 (float8e8m0) block scales and a per-expert float32 global scale.
                         Requires an ONNX Runtime build with onnxruntime_USE_FP4_QMOE=ON, precision=int4 with symmetric
                         INT4 quantization, and is only supported on the CUDA EP.
+                    nvfp4 = NVFP4 QMoE weights on the CUDA EP (quant_type="nvfp4", expert_weight_bits=4, block_size=16):
+                        4-bit e2m1 weights with FP8-E4M3 block scales and a per-expert float32 global scale.
+                        Same build/precision/EP requirements as mxfp4.
                     This single option replaces the older per-type flags so new schemes can be added without a new flag.
                 use_8bits_moe = [DEPRECATED] Use 'moe_quant_type=int8' instead. Use 8-bit quantization for MoE layers. Default is false.
                     If true, the QMoE op will use 8-bit quantization. If false, the QMoE op will use 4-bit quantization.
+                kv_cache_quant_type = Quantization scheme for the KV cache. Default is 'none' (no quantization).
+                    Supported values: none, int8_per_tensor, int8_per_channel, int4_per_tensor, int4_per_channel, fp8_per_tensor, fp8_per_channel.
+                    The `int8`/`int4`/`fp8` prefix selects the KV cache bit width and the `per_tensor`/`per_channel` suffix selects the scale granularity.
+                    Quantized KV cache is only supported for the CPU and CUDA execution providers.
+                    When combined with use_paged_attention=true, only the int8_* and fp8_* schemes are supported
+                    (PagedAttention has no sub-byte cache backend, so int4_* is rejected).
+                kv_cache_scale_file = Path to a JSON file with calibrated per-layer KV cache scales. Required when kv_cache_quant_type is enabled.
+                    Format: {"scales": {"k_scales": [...per layer...], "v_scales": [...per layer...]}} with one entry per layer.
+                    Each per-layer entry is a scalar (per_tensor) or a length-(num_kv_heads * head_size) vector (per_channel).
                 disable_qkv_fusion = Disable QKV fusion in the model. Default is false.
                     If true, the model will not fuse the Q, K, and V projections. Automatically assumed for certain EPs.
                 fuse_qk_norm_gqa = Enable QK Norm GQA fusion for CUDA and WebGPU. Default is true.

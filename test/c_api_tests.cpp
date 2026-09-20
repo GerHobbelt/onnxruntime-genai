@@ -416,6 +416,86 @@ TEST(CAPITests, EndToEndPhiBatch) {
 #endif
 }
 
+// Every ORT tensor is batch*beam wide: Run receives a [batch_size, sequence]
+// prompt buffer and DefaultInputIDs expands it over beams. These graphs declare
+// fixed dimensions so a mis-sized tensor fails to bind.
+TEST(CAPITests, MarianBatchIOContract) {
+  auto model = OgaModel::Create(MODEL_PATH "marian-batch");
+
+  // One token per row; MarianState::Run appends eos, giving a width of 2.
+  const std::array<int32_t, 1> first{5};
+  const std::array<int32_t, 1> second{7};
+  auto sequences = OgaSequences::Create();
+  sequences->Append(first.data(), first.size());
+  sequences->Append(second.data(), second.size());
+
+  auto params = OgaGeneratorParams::Create(*model);
+  params->SetSearchOption("batch_size", 2);
+
+  auto generator = OgaGenerator::Create(*model, *params);
+  generator->AppendTokenSequences(*sequences);
+  generator->GenerateNextToken();
+
+  EXPECT_EQ(generator->GetSequenceCount(0), generator->GetSequenceCount(1));
+}
+
+// The decoder turns each row's attention-mask sum into its selected token.
+// Unequal prompt lengths therefore validate both per-row EOS insertion and
+// the actual mask values rather than only tensor dimensions.
+TEST(CAPITests, MarianBatchAttentionMaskValues) {
+  auto model = OgaModel::Create(MODEL_PATH "marian-batch-values");
+
+  const std::array<int32_t, 1> first{5};
+  const std::array<int32_t, 2> second{7, 8};
+  auto sequences = OgaSequences::Create();
+  sequences->Append(first.data(), first.size());
+  sequences->Append(second.data(), second.size());
+
+  auto params = OgaGeneratorParams::Create(*model);
+  params->SetSearchOption("batch_size", 2);
+
+  auto generator = OgaGenerator::Create(*model, *params);
+  generator->AppendTokenSequences(*sequences);
+  const auto generated_start = generator->TokenCount();
+  generator->GenerateNextToken();
+
+  ASSERT_EQ(generated_start, 2U);
+  ASSERT_GT(generator->GetSequenceCount(0), generated_start);
+  ASSERT_GT(generator->GetSequenceCount(1), generated_start);
+  EXPECT_EQ(generator->GetSequenceData(0)[generated_start], 2);
+  EXPECT_EQ(generator->GetSequenceData(1)[generated_start], 3);
+}
+
+// Beam search makes every graph tensor batch*beam wide. The prompt length is
+// load-bearing: at two tokens the correct sequence width is 3 and sizing the
+// prompt buffer by batch*beam gives 4, so the fixture rejects the regression.
+TEST(CAPITests, MarianBatchWithBeamsIOContract) {
+  auto model = OgaModel::Create(MODEL_PATH "marian-batch-beams");
+
+  const std::array<int32_t, 2> first{5, 6};
+  const std::array<int32_t, 2> second{7, 8};
+  auto sequences = OgaSequences::Create();
+  sequences->Append(first.data(), first.size());
+  sequences->Append(second.data(), second.size());
+
+  auto params = OgaGeneratorParams::Create(*model);
+  params->SetSearchOption("batch_size", 2);
+
+  auto generator = OgaGenerator::Create(*model, *params);
+  generator->AppendTokenSequences(*sequences);
+  generator->GenerateNextToken();
+  ASSERT_FALSE(generator->IsDone());
+  auto logits = generator->GetLogits();
+  EXPECT_EQ(logits->Shape(), (std::vector<int64_t>{4, 1, 32001}));
+  generator->GenerateNextToken();
+
+  auto next_tokens = generator->GetNextTokens();
+  constexpr std::array<int32_t, 4> expected_tokens{2, 2, 4, 4};
+  ASSERT_EQ(next_tokens.size(), expected_tokens.size());
+  for (size_t beam = 0; beam < expected_tokens.size(); ++beam)
+    EXPECT_EQ(next_tokens[beam], expected_tokens[beam]) << "beam " << beam;
+}
+
 #if ENABLE_ENGINE_TESTS
 TEST(CAPIEngineTests, EndToEndPhiBatch) {
   auto model = OgaModel::Create(PHI2_PATH);
@@ -1997,6 +2077,74 @@ TEST(CAPITests, ParakeetTdtTranscribeLong) {
 
   auto transcription = RunParakeetTdt(PARAKEET_TDT_AUDIO_TEDLIUM);
   EXPECT_FALSE(transcription.empty());
+}
+
+// Test that bot/eot/bor/eor throw for models without these tokens configured
+TEST(CAPITests, TokenId_Unsupported) {
+  // tiny-random-gpt2 model has type "gpt2" which is NOT in the fallback map → throws
+  auto model = OgaModel::Create(MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32");
+  auto tokenizer = OgaTokenizer::Create(*model);
+
+  EXPECT_THROW(tokenizer->GetBotTokenId(), std::runtime_error);
+  EXPECT_THROW(tokenizer->GetEotTokenId(), std::runtime_error);
+  EXPECT_THROW(tokenizer->GetBorTokenId(), std::runtime_error);
+  EXPECT_THROW(tokenizer->GetEorTokenId(), std::runtime_error);
+}
+
+TEST(CAPITests, TokenId_FromConfig) {
+  // Create a temporary model directory with bot/eot/bor/eor token IDs in model section
+  auto temp_dir = std::filesystem::temp_directory_path() / "oga_test_tool_tags";
+  std::filesystem::remove_all(temp_dir);  // Clean up any leftover from a previous failed run
+  std::filesystem::create_directories(temp_dir);
+
+  // Copy minimal model files from tiny-random-gpt2
+  std::string src_dir = MODEL_PATH "hf-internal-testing/tiny-random-gpt2-fp32";
+  for (const auto& entry : std::filesystem::directory_iterator(src_dir)) {
+    if (entry.path().filename() != "genai_config.json") {
+      std::filesystem::copy_file(entry.path(), temp_dir / entry.path().filename(),
+                                 std::filesystem::copy_options::overwrite_existing);
+    }
+  }
+
+  // Write genai_config.json with token IDs in model section
+  {
+    std::ofstream f((temp_dir / "genai_config.json").string());
+    f << R"({
+  "model": {
+    "type": "gpt2",
+    "pad_token_id": 98,
+    "bos_token_id": 98,
+    "eos_token_id": 98,
+    "vocab_size": 1000,
+    "context_length": 512,
+    "bot_token_id": 151657,
+    "eot_token_id": 151658,
+    "bor_token_id": 151659,
+    "eor_token_id": 151660,
+    "decoder": {
+      "session_options": { "provider_options": [] },
+      "filename": "past.onnx",
+      "num_key_value_heads": 4,
+      "head_size": 8,
+      "num_hidden_layers": 5,
+      "inputs": { "past_names": "past_%d" },
+      "outputs": { "present_names": "present_%d" }
+    }
+  }
+})";
+  }
+
+  auto model = OgaModel::Create(temp_dir.string().c_str());
+  auto tokenizer = OgaTokenizer::Create(*model);
+
+  // Tokenizer returns configured IDs from model section
+  EXPECT_EQ(tokenizer->GetBotTokenId(), 151657);
+  EXPECT_EQ(tokenizer->GetEotTokenId(), 151658);
+  EXPECT_EQ(tokenizer->GetBorTokenId(), 151659);
+  EXPECT_EQ(tokenizer->GetEorTokenId(), 151660);
+
+  // Cleanup
+  std::filesystem::remove_all(temp_dir);
 }
 
 // Regression test for MSRC: malformed audio buffers smaller than the minimum valid

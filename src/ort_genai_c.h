@@ -62,6 +62,7 @@ typedef enum OgaElementType {
 typedef struct OgaResult OgaResult;
 typedef struct OgaGeneratorParams OgaGeneratorParams;
 typedef struct OgaGenerator OgaGenerator;
+typedef struct OgaSpeculativeStats OgaSpeculativeStats;
 typedef struct OgaRuntimeSettings OgaRuntimeSettings;
 typedef struct OgaConfig OgaConfig;
 typedef struct OgaModel OgaModel;
@@ -109,6 +110,19 @@ typedef struct OgaStreamingProcessor OgaStreamingProcessor;
  *       them (on that reference) and release the reference after OgaShutdown(), once all GenAI usage is finished.
  */
 OGA_EXPORT void OGA_API_CALL OgaShutdown();
+
+/**
+ * \brief Enable or disable non-essential telemetry event collection.
+ *
+ * Telemetry can be fully disabled at compile time (ENABLE_TELEMETRY=OFF) or by setting
+ * ORT_DISABLE_TELEMETRY=1 before initialization. The environment variable prevents the uploader,
+ * events, and persistent device identifier from being created for the process lifetime. Runtime
+ * controls suppress new detailed model, generation, adapter, and error telemetry; the process
+ * information event may still be emitted.
+ *
+ * \param[in] enabled true to enable telemetry, false to disable.
+ */
+OGA_EXPORT void OGA_API_CALL OgaSetTelemetryEnabled(bool enabled);
 
 /**
  * \param[in] result OgaResult that contains the error message.
@@ -499,6 +513,24 @@ OGA_EXPORT OgaResult* OGA_API_CALL OgaGeneratorParamsGetSearchNumber(const OgaGe
 OGA_EXPORT OgaResult* OGA_API_CALL OgaGeneratorParamsGetSearchBool(const OgaGeneratorParams* params, const char* name, bool* value);
 
 /**
+ * \brief Set a numerical value for a speculative decoding option.
+ * \param[in] params The generator params to set.
+ * \param[in] name The name of the speculative option (e.g. "max_draft_tokens").
+ * \param[in] value The value to set.
+ * \return OgaResult containing the error message if setting the option failed.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaGeneratorParamsSetSpeculativeNumber(OgaGeneratorParams* params, const char* name, double value);
+
+/**
+ * \brief Get a numerical value for a speculative decoding option.
+ * \param[in] params The generator params to query.
+ * \param[in] name The name of the speculative option.
+ * \param[out] value The current value.
+ * \return OgaResult containing the error message if getting the option failed.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaGeneratorParamsGetSpeculativeNumber(const OgaGeneratorParams* params, const char* name, double* value);
+
+/**
  * \brief Creates a generator from the given model and generator params.
  * \param[in] model The model to use for generation.
  * \param[in] params The parameters to use for generation.
@@ -594,7 +626,7 @@ OGA_EXPORT OgaResult* OGA_API_CALL OgaGenerator_SetRuntimeOption(OgaGenerator* g
 
 /**
  * \brief Rewinds the generator to the given length. This is useful when the user wants to rewind the generator to a specific length
- *        and continue generating from that point.
+ *        and continue generating from that point. Rewinding is not supported with beam search.
  * \param[in] generator The generator to rewind to the given length.
  * \param[in] new_length The desired length in tokens after rewinding.
  * \return OgaResult containing the error message if the rewinding failed.
@@ -658,6 +690,23 @@ OGA_EXPORT size_t OGA_API_CALL OgaGenerator_GetSequenceCount(const OgaGenerator*
  *         be used after the OgaGenerator is destroyed.
  */
 OGA_EXPORT const int32_t* OGA_API_CALL OgaGenerator_GetSequenceData(const OgaGenerator* generator, size_t index);
+
+/** \brief Creates an immutable snapshot of the accumulated speculative-decoding statistics.
+ *  Values are zero for non-speculative models. The caller must destroy the returned object. */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaGenerator_GetSpeculativeStats(const OgaGenerator* generator, OgaSpeculativeStats** out);
+OGA_EXPORT void OGA_API_CALL OgaDestroySpeculativeStats(OgaSpeculativeStats* stats);
+
+/** \brief Gets an integer counter from a speculative statistics snapshot. */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaSpeculativeStatsGetCount(
+    const OgaSpeculativeStats* stats, const char* name, uint64_t* value);
+
+/** \brief Gets a timing, rate, ratio, average, or speedup value from a statistics snapshot. */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaSpeculativeStatsGetNumber(
+    const OgaSpeculativeStats* stats, const char* name, double* value);
+
+/** \brief Gets a boolean value from a speculative statistics snapshot. */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaSpeculativeStatsGetBool(
+    const OgaSpeculativeStats* stats, const char* name, bool* value);
 
 OGA_EXPORT OgaResult* OGA_API_CALL OgaCreateTokenizer(const OgaModel* model, OgaTokenizer** out);
 OGA_EXPORT void OGA_API_CALL OgaDestroyTokenizer(OgaTokenizer*);
@@ -727,6 +776,38 @@ OGA_EXPORT OgaResult* OGA_API_CALL OgaTokenizerGetEosTokenIds(const OgaTokenizer
  * \return OgaResult containing the error message if returning the PAD token id fails.
  */
 OGA_EXPORT OgaResult* OGA_API_CALL OgaTokenizerGetPadTokenId(const OgaTokenizer* tokenizer, int32_t* token_id);
+
+/**
+ * \brief Return the BOT (beginning of tool call) token id. Returns an error if the model does not define one.
+ * \param[in] tokenizer The tokenizer to read from
+ * \param[out] token_id The BOT token id
+ * \return OgaResult containing the error message if the call fails.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaTokenizerGetBotTokenId(const OgaTokenizer* tokenizer, int32_t* token_id);
+
+/**
+ * \brief Return the EOT (end of tool call) token id. Returns an error if the model does not define one.
+ * \param[in] tokenizer The tokenizer to read from
+ * \param[out] token_id The EOT token id
+ * \return OgaResult containing the error message if the call fails.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaTokenizerGetEotTokenId(const OgaTokenizer* tokenizer, int32_t* token_id);
+
+/**
+ * \brief Return the BOR (beginning of reasoning) token id. Returns an error if the model does not define one.
+ * \param[in] tokenizer The tokenizer to read from
+ * \param[out] token_id The BOR token id
+ * \return OgaResult containing the error message if the call fails.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaTokenizerGetBorTokenId(const OgaTokenizer* tokenizer, int32_t* token_id);
+
+/**
+ * \brief Return the EOR (end of reasoning) token id. Returns an error if the model does not define one.
+ * \param[in] tokenizer The tokenizer to read from
+ * \param[out] token_id The EOR token id
+ * \return OgaResult containing the error message if the call fails.
+ */
+OGA_EXPORT OgaResult* OGA_API_CALL OgaTokenizerGetEorTokenId(const OgaTokenizer* tokenizer, int32_t* token_id);
 
 /**
  * Encodes a single string and adds the encoded sequence of tokens to the OgaSequences. The OgaSequences must be freed with OgaDestroySequences

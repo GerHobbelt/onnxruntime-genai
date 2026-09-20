@@ -122,6 +122,7 @@ def _load_builder_cli_module(monkeypatch):
         "Gemma3Model",
         "GemmaModel",
         "GPTOSSModel",
+        "GraniteMoeHybridModel",
         "GraniteModel",
         "HunyuanDenseV1Model",
         "InternLM2Model",
@@ -151,6 +152,9 @@ def _load_builder_cli_module(monkeypatch):
         "WhisperModel",
     ):
         setattr(builders_module, class_name, type(class_name, (), {}))
+    # Submodule imports (e.g. `from builders.quant_config import ...`) must resolve to the
+    # real, dependency-free modules rather than the class stubs above.
+    builders_module.__path__ = [str(BUILDERS_DIR)]
     monkeypatch.setitem(sys.modules, "builders", builders_module)
 
     module_name = "builder_cli_under_test"

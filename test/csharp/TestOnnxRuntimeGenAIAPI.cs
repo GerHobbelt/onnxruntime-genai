@@ -91,6 +91,13 @@ namespace Microsoft.ML.OnnxRuntimeGenAI.Tests
 
         private static int _epLibrariesRegistered = 0;
 
+        [Fact(DisplayName = "TestTelemetryControl")]
+        public void TestTelemetryControl()
+        {
+            Utils.DisableTelemetryEvents();
+            Utils.EnableTelemetryEvents();
+        }
+
         // Execution providers that can be loaded as plugin libraries at test time, mapped to the
         // platform-independent stem of their library file. The full file name is built as
         // "<prefix><stem><suffix>", e.g. on Windows "webgpu" -> "onnxruntime_providers_webgpu.dll".
@@ -214,6 +221,7 @@ namespace Microsoft.ML.OnnxRuntimeGenAI.Tests
 
                         generatorParams.SetSearchOption("max_length", maxLength);
                         generatorParams.SetSearchOption("batch_size", batchSize);
+                        generatorParams.SetSpeculativeNumber("max_draft_tokens", 4);
 
                         using (var generator = new Generator(model, generatorParams))
                         {
@@ -223,6 +231,13 @@ namespace Microsoft.ML.OnnxRuntimeGenAI.Tests
                             Assert.False(generator.IsDone());
                             Assert.Equal(maxLength, generatorParams.GetSearchNumber("max_length"));
                             Assert.True(generatorParams.GetSearchBool("early_stopping"));
+                            Assert.Equal(4.0, generatorParams.GetSpeculativeNumber("max_draft_tokens"));
+                            using (SpeculativeStats stats = generator.GetSpeculativeStats())
+                            {
+                                Assert.Equal(0UL, stats.GetCount("rounds"));
+                                Assert.False(stats.GetBool("formula_supported"));
+                                Assert.Equal(0.0, stats.GetNumber("acceptance_rate"));
+                            }
                             Assert.Equal(generator.GetSequence(0).Length, (int)generator.TokenCount());
 
                             while (!generator.IsDone())

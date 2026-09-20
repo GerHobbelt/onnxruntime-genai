@@ -65,6 +65,30 @@ inline void OgaCheckResult(OgaResult* result) {
   }
 }
 
+struct OgaSpeculativeStats : OgaAbstract {
+  uint64_t GetCount(const char* name) const {
+    uint64_t value;
+    OgaCheckResult(OgaSpeculativeStatsGetCount(this, name, &value));
+    return value;
+  }
+
+  double GetNumber(const char* name) const {
+    double value;
+    OgaCheckResult(OgaSpeculativeStatsGetNumber(this, name, &value));
+    return value;
+  }
+
+  bool GetBool(const char* name) const {
+    bool value;
+    OgaCheckResult(OgaSpeculativeStatsGetBool(this, name, &value));
+    return value;
+  }
+
+  static void operator delete(void* p) {
+    OgaDestroySpeculativeStats(reinterpret_cast<OgaSpeculativeStats*>(p));
+  }
+};
+
 struct OgaFloat16_t;
 struct OgaBFloat16_t;
 
@@ -342,6 +366,32 @@ struct OgaTokenizer : OgaAbstract {
     return token_id;
   }
 
+  // Tool-calling and reasoning token IDs (bot/eot/bor/eor).
+  // Throws if the model does not define the token.
+  int32_t GetBotTokenId() const {
+    int32_t token_id;
+    OgaCheckResult(OgaTokenizerGetBotTokenId(this, &token_id));
+    return token_id;
+  }
+
+  int32_t GetEotTokenId() const {
+    int32_t token_id;
+    OgaCheckResult(OgaTokenizerGetEotTokenId(this, &token_id));
+    return token_id;
+  }
+
+  int32_t GetBorTokenId() const {
+    int32_t token_id;
+    OgaCheckResult(OgaTokenizerGetBorTokenId(this, &token_id));
+    return token_id;
+  }
+
+  int32_t GetEorTokenId() const {
+    int32_t token_id;
+    OgaCheckResult(OgaTokenizerGetEorTokenId(this, &token_id));
+    return token_id;
+  }
+
   void Encode(const char* str, OgaSequences& sequences) const {
     OgaCheckResult(OgaTokenizerEncode(this, str, &sequences));
   }
@@ -445,6 +495,16 @@ struct OgaGeneratorParams : OgaAbstract {
     return value;
   }
 
+  void SetSpeculativeNumber(const char* name, double value) {
+    OgaCheckResult(OgaGeneratorParamsSetSpeculativeNumber(this, name, value));
+  }
+
+  double GetSpeculativeNumber(const char* name) const {
+    double value;
+    OgaCheckResult(OgaGeneratorParamsGetSpeculativeNumber(this, name, &value));
+    return value;
+  }
+
   static void operator delete(void* p) { OgaDestroyGeneratorParams(reinterpret_cast<OgaGeneratorParams*>(p)); }
 };
 
@@ -523,6 +583,12 @@ struct OgaGenerator : OgaAbstract {
 
   const int32_t* GetSequenceData(size_t index) const {
     return OgaGenerator_GetSequenceData(this, index);
+  }
+
+  std::unique_ptr<OgaSpeculativeStats> GetSpeculativeStats() const {
+    OgaSpeculativeStats* stats;
+    OgaCheckResult(OgaGenerator_GetSpeculativeStats(this, &stats));
+    return std::unique_ptr<OgaSpeculativeStats>(stats);
   }
 
   std::unique_ptr<OgaTensor> GetInput(const char* name) {
@@ -889,6 +955,10 @@ inline int GetCurrentGpuDeviceId() {
   int device_id;
   OgaCheckResult(OgaGetCurrentGpuDeviceId(&device_id));
   return device_id;
+}
+
+inline void SetTelemetryEnabled(bool enabled) {
+  OgaSetTelemetryEnabled(enabled);
 }
 
 }  // namespace Oga
