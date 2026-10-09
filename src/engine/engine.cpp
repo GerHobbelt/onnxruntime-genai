@@ -1205,14 +1205,21 @@ std::shared_ptr<Request> Engine::CreateRequest(const RequestOptions& options) {
         R"(config.overlay('{"search": {"num_beams": 1}}') -- )"
         "and batch across Requests instead.");
   }
-  const size_t model_ceiling = static_cast<size_t>(model_search.max_length);
+  const size_t configured_default = static_cast<size_t>(model_search.max_length);
+  const uint64_t capability = GetCapabilities().max_request_length;
+  if (capability > std::numeric_limits<size_t>::max()) {
+    throw std::overflow_error("Engine max_request_length exceeds size_t.");
+  }
+  const size_t engine_ceiling = capability == 0 ? configured_default : static_cast<size_t>(capability);
   const size_t max_session_tokens =
-      options.max_session_tokens.value_or(model_ceiling);
-  if (max_session_tokens == 0 || max_session_tokens > model_ceiling) {
+      options.max_session_tokens.value_or(std::min(configured_default, engine_ceiling));
+  if (max_session_tokens == 0 || max_session_tokens > engine_ceiling) {
+    const char* ceiling_name =
+        capability == 0 ? "model-configured search.max_length" : "Engine's max_request_length";
     throw std::runtime_error(
         "max_session_tokens (" + std::to_string(max_session_tokens) +
-        ") must be greater than zero and no greater than the model-configured search.max_length (" +
-        std::to_string(model_ceiling) + ").");
+        ") must be greater than zero and no greater than the " + ceiling_name + " (" +
+        std::to_string(engine_ceiling) + ").");
   }
   auto request = std::make_shared<Request>(
       *model_, max_session_tokens, abandonment_pending_);
@@ -1288,8 +1295,13 @@ uint64_t Engine::BeginTurn(const std::shared_ptr<Request>& request,
     const bool restartable_canceled_turn =
         request->IsRestartableCanceledTurn() &&
         !cache_manager_->IsResident(request);
-    ValidateRequestCanContinue(request, restartable_canceled_turn);
-    if (!restartable_canceled_turn) {
+    const bool replay_rewound_request =
+        request->NeedsReplayAfterRewind() &&
+        !cache_manager_->IsResident(request);
+    const bool allow_nonresident =
+        restartable_canceled_turn || replay_rewound_request;
+    ValidateRequestCanContinue(request, allow_nonresident);
+    if (!allow_nonresident) {
       request->ValidateContinuousDecodingSupport();
     }
   }
@@ -1392,6 +1404,65 @@ bool Engine::CancelRequest(const std::shared_ptr<Request>& request, uint64_t tur
     pending_events_.push_back(std::move(terminal));
   }
   return true;
+}
+
+void Engine::RewindRequestToStartOfTurn(
+    const std::shared_ptr<Request>& request,
+    uint64_t turn_id) {
+  ValidateOwnerThread();
+  CompleteNonresidentClosedRequests();
+  ReclaimAbandonedRequests();
+  if (health_ == EngineHealth::Unhealthy) {
+    std::rethrow_exception(fatal_error_);
+  }
+  if (!request || !request->BelongsTo(*this)) {
+    throw std::runtime_error(
+        "Cannot rewind a request that does not belong to this engine.");
+  }
+  if (!IsTurnComplete(request->Status())) {
+    if (IsClosed(request->Status())) {
+      throw std::runtime_error("Cannot rewind a closed request.");
+    }
+    throw std::runtime_error(
+        "Request rewind is only valid after the current turn is complete.");
+  }
+  if (request->FinishReason() == GenerationFinishReason::Failed) {
+    throw std::runtime_error(
+        "Cannot rewind a Request whose current turn failed.");
+  }
+  if (std::find_if(
+          pending_events_.begin() +
+              static_cast<ptrdiff_t>(pending_event_index_),
+          pending_events_.end(),
+          [&request](const EngineEvent& event) {
+            return event.request == request;
+          }) != pending_events_.end()) {
+    throw std::runtime_error(
+        "Cannot rewind a request while an Engine event is pending; "
+        "call Engine::Run() to drain the event before rewinding.");
+  }
+
+  const bool resident = cache_manager_->IsResident(request);
+  if (!resident && !request->IsRestartableCanceledTurn() &&
+      !request->NeedsReplayAfterRewind()) {
+    throw std::runtime_error(
+        "Cannot rewind a request whose model state is no longer resident.");
+  }
+
+  // Every fallible preparation and temporary allocation completes before committed target-cache
+  // ownership changes. The cache managers validate their complete release up front, then publish
+  // the ownership change through allocation-free no-throw operations.
+  cache_manager_->ValidateRewind(request);
+  auto rewind_state =
+      request->PrepareRewindToStartOfTurn(turn_id);
+  // Auxiliary decoders mirror a generated suffix that is no longer authoritative after rewind.
+  // Release them before the target cache so any fallible cleanup leaves target ownership intact.
+  CloseMtpRequest(request);
+  if (dflash2_drafter_) {
+    dflash2_drafter_->Release(request.get());
+  }
+  cache_manager_->ReleaseForRewind(request);
+  request->CommitRewind(std::move(rewind_state));
 }
 
 void Engine::CloseRequest(const std::shared_ptr<Request>& request) {
@@ -1565,6 +1636,9 @@ void Engine::ValidateRequestCanContinue(
   }
   if (!request->BelongsTo(*this)) {
     throw std::runtime_error("Cannot continue a request that does not belong to this engine.");
+  }
+  if (request->FinishReason() == GenerationFinishReason::Failed) {
+    throw std::runtime_error("Cannot continue a Request whose current turn failed.");
   }
 
   if (!allow_nonresident && !cache_manager_->IsResident(request)) {
@@ -2460,6 +2534,16 @@ EngineCapabilities Engine::GetCapabilities() const {
     const auto& batching = *model_->config_->engine.dynamic_batching;
     capabilities.configured_max_batch_size = batching.max_batch_size;
     capabilities.max_scheduled_tokens = batching.max_scheduled_tokens;
+    const size_t block_count = cache_manager_->TargetBlockCount();
+    const size_t block_size = cache_manager_->TargetBlockSize();
+    if (block_count != 0 && block_size != 0) {
+      if (block_count > (std::numeric_limits<uint64_t>::max() - 1) / block_size) {
+        throw std::overflow_error("Engine max_request_length exceeds uint64_t.");
+      }
+      const uint64_t cache_limit = static_cast<uint64_t>(block_count) * block_size + 1;
+      capabilities.max_request_length =
+          std::min<uint64_t>(static_cast<uint64_t>(model_->config_->model.context_length), cache_limit);
+    }
   } else if (model_->config_->engine.static_batching) {
     capabilities.configured_max_batch_size =
         model_->config_->engine.static_batching->max_batch_size;

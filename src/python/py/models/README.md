@@ -75,7 +75,7 @@ The tool currently supports the following model architectures.
 - Granite MoE Hybrid
 - HunYuan Dense V1
 - InternLM2
-- LFM2 (text and the decoder of LFM2-VL / LFM2.5-VL)
+- LFM2 (text and the decoders of LFM2-VL / LFM2.5-VL and LFM2-Audio / LFM2.5-Audio)
 - LFM2 MoE
 - Llama
 - Mistral
@@ -154,6 +154,11 @@ Runtime fragments are applied after composite configuration generation. Objects
 merge recursively; arrays replace whole. The validator rejects absent engine or
 speculative capabilities, invalid allocation and draft limits, provider changes,
 and changes to graph-required session options.
+
+For memory-dependent INT4/INT8 KV-cache graphs that share external weights, use
+the [KV-cache variant authoring workflow](../../../../docs/ModelBuilderConfiguration.md#authoring-kv-cache-variants).
+The supported `KVCacheVariant` API requires source and output graphs in the same
+directory and validates every layer's per-channel scale geometry.
 
 Python callers should pass structured dictionaries to `parse_extra_options`
 before calling `create_model` with its returned options. The legacy options

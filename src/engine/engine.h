@@ -33,6 +33,7 @@ enum class EngineHealth {
 struct EngineCapabilities {
   size_t configured_max_batch_size{};
   size_t max_scheduled_tokens{};
+  uint64_t max_request_length{};
 };
 
 enum class EngineErrorCode : uint32_t {
@@ -212,6 +213,8 @@ struct Engine : std::enable_shared_from_this<Engine>,
   uint64_t BeginTurn(const std::shared_ptr<Request>& request,
                      std::span<const int32_t> tokens,
                      const TurnOptions& options);
+  void RewindRequestToStartOfTurn(
+      const std::shared_ptr<Request>& request, uint64_t turn_id);
   void CloseRequest(const std::shared_ptr<Request>& request);
   bool CancelRequest(const std::shared_ptr<Request>& request, uint64_t turn_id);
 

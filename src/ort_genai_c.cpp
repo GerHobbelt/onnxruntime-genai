@@ -1518,6 +1518,11 @@ size_t OgaEngineCapabilitiesGetMaxScheduledTokens(
   return capabilities ? capabilities->max_scheduled_tokens : 0;
 }
 
+uint64_t OgaEngineCapabilitiesGetMaxRequestLength(
+    const OgaEngineCapabilities* capabilities) {
+  return capabilities ? capabilities->max_request_length : 0;
+}
+
 OgaResult* OgaCreateEngineEventBuffer(
     OgaEngine* engine,
     size_t capacity,
@@ -2093,6 +2098,17 @@ OgaResult* OgaRequestCancelTurn(
     throw std::runtime_error("out_cancelled must not be null.");
   }
   *out_cancelled = request->Cancel(turn_id);
+  return nullptr;
+  OGA_CATCH
+}
+
+OgaResult* OgaRequestRewindToStartOfTurn(
+    OgaRequest* request, uint64_t turn_id) {
+  OGA_TRY
+  if (!request) {
+    throw std::runtime_error("request must not be null.");
+  }
+  request->RewindToStartOfTurn(turn_id);
   return nullptr;
   OGA_CATCH
 }
