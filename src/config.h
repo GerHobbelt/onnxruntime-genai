@@ -544,6 +544,8 @@ struct Config {
         // ones. Empty when the model has no windowed paged layers.
         std::string block_table_windowed{Defaults::BlockTableWindowedName};
         std::string attention_metadata{Defaults::AttentionMetadataName};
+        // Packed token rows to project through the LM head. Empty for legacy full-logits models.
+        std::string logits_indices;
         std::string past_conv_names{Defaults::PastConvName};  // Conv cache input name template (LFM2)
         std::string past_recurrent_names{Defaults::PastRecurrentName};
         std::string state_update_capture_count{Defaults::StateUpdateCaptureCountName};  // Per-sequence capture count
@@ -678,6 +680,10 @@ struct Config {
       int selector_top_k{};
       int mask_token_id{};
       int sliding_window{-1};
+      bool independent_sampling{};
+      float sampling_temperature{0.1f};
+      float sampling_top_p{0.95f};
+      float sampling_min_p{0.3f};
       std::vector<int> aux_hidden_state_layers;
 
       // Name of the main decoder's auxiliary hidden-states output that feeds the drafter.
@@ -686,6 +692,7 @@ struct Config {
       struct Inputs {
         std::string aux_hidden_states{"aux_hidden_states"};
         std::string input_ids{Defaults::InputIdsName};
+        std::string embeddings{Defaults::InputsEmbedsName};
         std::string q_row_map{"q_row_map"};
         std::string qkv_row_map{"qkv_row_map"};
         std::string block_row_index{"block_row_index"};
@@ -756,6 +763,8 @@ struct Config {
       std::optional<float> gpu_utilization_factor;  // Fraction of free GPU memory to use for key-value cache.
       size_t max_batch_size{16};                    // Maximum batch size for dynamically batching requests.
       size_t max_scheduled_tokens{2048};            // Maximum tokens in one dynamically batched model run.
+      bool prefix_caching{true};
+      bool prefix_caching_explicitly_set{};
     };
     std::optional<DynamicBatching> dynamic_batching;  // Dynamic batching settings
 
@@ -772,6 +781,28 @@ struct Config {
     // Runtime-only counterpart for the auxiliary hidden states consumed by DFlash 2.
     bool aux_hidden_states_output_required{};
   } engine;  // Engine settings
+
+  struct RuntimeProfile {
+    std::string id;
+
+    struct Eligibility {
+      std::optional<uint64_t> minimum_total_device_memory_bytes;
+      std::optional<uint64_t> maximum_total_device_memory_bytes;
+    } eligibility;
+
+    struct Overlay {
+      struct DynamicBatching {
+        std::optional<size_t> num_blocks;
+        std::optional<size_t> max_batch_size;
+        std::optional<size_t> max_scheduled_tokens;
+      } dynamic_batching;
+
+      struct Search {
+        std::optional<size_t> chunk_size;
+      } search;
+    } overlay;
+  };
+  std::vector<RuntimeProfile> runtime_profiles;
 
   void AddMapping(const std::string& nominal_name, const std::string& graph_name);
   // Returns graph name and true if the nominal name is found in the mapping
@@ -793,6 +824,7 @@ std::unique_ptr<Config> CreateMtpDecoderConfig(const Config& config);
 void ClearProviders(Config& config);
 void SetProviderOption(Config& config, std::string_view provider_name, std::string_view option_name, std::string_view option_value);
 void OverlayConfig(Config& config, std::string_view json);
+void ApplyRuntimeProfile(Config& config, uint64_t total_device_memory_bytes);
 int SafeDoubleToInt(double x, std::string_view name);
 
 // Logs a warning when the drafter's exported geometry is narrower than
